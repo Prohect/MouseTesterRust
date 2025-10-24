@@ -44,7 +44,7 @@ The GUI provides:
 - **Events table** - Detailed view of individual events
 - **Toggle controls** - Show/hide different visualization panels
 
-Press **F2** to stop recording and finalize the analysis.
+Press **F2** to stop recording and finalize the analysis. On Windows, F2 works globally even when the GUI window is not focused.
 
 ### CLI Mode (Traditional)
 
