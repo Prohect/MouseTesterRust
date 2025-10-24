@@ -1,0 +1,2 @@
+[build]
+rustflags = ["-L", "F:\\Programme\\npcap-sdk-1.15\\Lib\\x64"]

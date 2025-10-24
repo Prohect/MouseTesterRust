@@ -1,0 +1,13 @@
+[package]
+name = "MouseTesterRust"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.100"
+byteorder = "1.5.0"
+env = "1.0.1"
+hex = "0.4.3"
+pcap = "2.3.0"
+pcap-parser = "0.17.0"
+regex = "1.12.2"
