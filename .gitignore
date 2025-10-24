@@ -1,1 +1,5 @@
 /target
+output.csv
+mouse_plot.png
+*.csv
+*.png
