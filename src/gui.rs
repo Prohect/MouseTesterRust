@@ -311,3 +311,57 @@ pub fn run_gui(events: Arc<Mutex<Vec<MouseMoveEvent>>>) -> Result<(), eframe::Er
         Box::new(|_cc| Box::new(MouseAnalyzerGui::new(events))),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_test_events() -> Vec<MouseMoveEvent> {
+        vec![
+            MouseMoveEvent { dx: 10, dy: 5, time: 0.0 },
+            MouseMoveEvent { dx: -5, dy: 10, time: 0.1 },
+            MouseMoveEvent { dx: 3, dy: -3, time: 0.2 },
+            MouseMoveEvent { dx: 0, dy: 0, time: 0.3 },
+        ]
+    }
+
+    #[test]
+    fn test_stats_calculation() {
+        let gui = MouseAnalyzerGui::new(Arc::new(Mutex::new(vec![])));
+        let events = create_test_events();
+        let stats = gui.calculate_stats(&events);
+
+        assert_eq!(stats.count, 4);
+        assert_eq!(stats.duration, 0.3);
+        assert_eq!(stats.total_dx, 8);
+        assert_eq!(stats.total_dy, 12);
+        
+        // Check that distance is calculated
+        assert!(stats.total_distance > 0.0);
+        assert!(stats.avg_distance_per_event > 0.0);
+    }
+
+    #[test]
+    fn test_empty_events() {
+        let gui = MouseAnalyzerGui::new(Arc::new(Mutex::new(vec![])));
+        let stats = gui.calculate_stats(&[]);
+        
+        assert_eq!(stats.count, 0);
+        assert_eq!(stats.duration, 0.0);
+        assert_eq!(stats.total_dx, 0);
+        assert_eq!(stats.total_dy, 0);
+    }
+
+    #[test]
+    fn test_histogram_generation() {
+        let gui = MouseAnalyzerGui::new(Arc::new(Mutex::new(vec![])));
+        let events = create_test_events();
+        let stats = gui.calculate_stats(&events);
+
+        assert_eq!(stats.histogram.len(), 12);
+        
+        // At least one bucket should have events
+        let total_in_histogram: usize = stats.histogram.iter().sum();
+        assert_eq!(total_in_histogram, events.len());
+    }
+}
