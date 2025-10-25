@@ -104,7 +104,7 @@ impl UsbPcapHeader {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct TargetDevice {
+pub struct TargetDevice {
     bus_id: u16,
     device_address: u16,
     endpoint: u8,
@@ -298,7 +298,7 @@ fn analyze_and_write_csv_and_plot(events: &[MouseMoveEvent]) -> Result<()> {
     Ok(())
 }
 
-fn run_capture(
+pub fn run_capture(
     events_arc: Arc<Mutex<Vec<MouseMoveEvent>>>,
     stop_flag: Arc<AtomicBool>,
     target_device: Option<TargetDevice>,
@@ -460,7 +460,7 @@ fn main() -> Result<()> {
         
         // Run GUI on main thread (required by eframe)
         let stop_gui = Arc::clone(&stop_flag);
-        if let Err(e) = gui::run_gui(events_arc, stop_gui) {
+        if let Err(e) = gui::run_gui(events_arc, stop_gui, target_device) {
             eprintln!("GUI error: {}", e);
             return Err(anyhow!("GUI failed: {}", e));
         }
