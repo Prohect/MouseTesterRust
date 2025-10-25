@@ -395,8 +395,7 @@ impl eframe::App for MouseAnalyzerGui {
                                     
                                     let lod_events = if needs_lod_update {
                                         // Recalculate LOD with current bounds
-                                        let new_lod = self.apply_lod(&display_events, available_width as f64, Some(&current_bounds));
-                                        new_lod
+                                        self.apply_lod(&display_events, available_width as f64, Some(&current_bounds))
                                     } else {
                                         // Use cached LOD events
                                         self.cached_lod_events.clone()
