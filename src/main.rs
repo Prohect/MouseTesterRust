@@ -130,7 +130,7 @@ pub struct MouseMoveEvent {
 }
 
 #[cfg(windows)]
-mod key_utils {
+pub mod key_utils {
     // Win32 GetAsyncKeyState via FFI
     #[link(name = "user32")]
     unsafe extern "system" {
@@ -146,7 +146,7 @@ mod key_utils {
 }
 
 #[cfg(not(windows))]
-mod key_utils {
+pub mod key_utils {
     // fallback: no OS-level F2 detection available here
     pub fn is_f2_pressed() -> bool {
         false
@@ -459,7 +459,8 @@ fn main() -> Result<()> {
         });
         
         // Run GUI on main thread (required by eframe)
-        if let Err(e) = gui::run_gui(events_arc) {
+        let stop_gui = Arc::clone(&stop_flag);
+        if let Err(e) = gui::run_gui(events_arc, stop_gui) {
             eprintln!("GUI error: {}", e);
             return Err(anyhow!("GUI failed: {}", e));
         }
