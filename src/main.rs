@@ -302,6 +302,7 @@ pub fn run_capture(
     events_arc: Arc<Mutex<Vec<MouseMoveEvent>>>,
     stop_flag: Arc<AtomicBool>,
     target_device: Option<TargetDevice>,
+    disable_f2_watcher: bool,
 ) -> Result<()> {
     println!("Filtering for target device: {:?}", target_device);
     println!("Starting USBPcapCMD for device {}", r"\\.\USBPcap1");
@@ -316,7 +317,8 @@ pub fn run_capture(
     let child_pid = child.id().to_string();
 
     // Keyboard watcher thread (Windows: GetAsyncKeyState). On F2 it will try to stop the capture.
-    {
+    // Only start this thread if not disabled (e.g., when GUI is handling F2 separately)
+    if !disable_f2_watcher {
         let stop_flag = Arc::clone(&stop_flag);
         let _pid = child_pid.clone();
         thread::spawn(move || {
@@ -453,7 +455,8 @@ fn main() -> Result<()> {
         let events_capture = Arc::clone(&events_arc);
         let stop_capture = Arc::clone(&stop_flag);
         thread::spawn(move || {
-            if let Err(e) = run_capture(events_capture, stop_capture, target_device) {
+            // Disable F2 watcher in GUI mode since GUI handles F2 itself
+            if let Err(e) = run_capture(events_capture, stop_capture, target_device, true) {
                 eprintln!("Capture error: {}", e);
             }
         });
@@ -466,7 +469,8 @@ fn main() -> Result<()> {
         }
     } else {
         // CLI mode: run capture on main thread
-        run_capture(Arc::clone(&events_arc), Arc::clone(&stop_flag), target_device)?;
+        // Enable F2 watcher in CLI mode for keyboard control
+        run_capture(Arc::clone(&events_arc), Arc::clone(&stop_flag), target_device, false)?;
         
         // extract events for analysis and plotting
         let events = events_arc.lock().unwrap().clone();
