@@ -231,7 +231,8 @@ impl eframe::App for MouseAnalyzerGui {
                 let stop_capture = Arc::clone(&self.stop_flag);
                 let target_device = self.target_device;
                 thread::spawn(move || {
-                    if let Err(e) = crate::run_capture(events_capture, stop_capture, target_device) {
+                    // Disable F2 watcher in GUI mode since GUI handles F2 itself
+                    if let Err(e) = crate::run_capture(events_capture, stop_capture, target_device, true) {
                         eprintln!("Capture error: {}", e);
                     }
                 });
