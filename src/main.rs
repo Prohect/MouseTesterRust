@@ -298,12 +298,7 @@ fn analyze_and_write_csv_and_plot(events: &[MouseMoveEvent]) -> Result<()> {
     Ok(())
 }
 
-pub fn run_capture(
-    events_arc: Arc<Mutex<Vec<MouseMoveEvent>>>,
-    stop_flag: Arc<AtomicBool>,
-    target_device: Option<TargetDevice>,
-    disable_f2_watcher: bool,
-) -> Result<()> {
+pub fn run_capture(events_arc: Arc<Mutex<Vec<MouseMoveEvent>>>, stop_flag: Arc<AtomicBool>, target_device: Option<TargetDevice>, disable_f2_watcher: bool) -> Result<()> {
     println!("Filtering for target device: {:?}", target_device);
     println!("Starting USBPcapCMD for device {}", r"\\.\USBPcap1");
 
@@ -470,7 +465,7 @@ fn main() -> Result<()> {
                 eprintln!("Capture error: {}", e);
             }
         });
-        
+
         // Run GUI on main thread (required by eframe)
         let stop_gui = Arc::clone(&stop_flag);
         if let Err(e) = gui::run_gui(events_arc, stop_gui, target_device) {
@@ -481,7 +476,7 @@ fn main() -> Result<()> {
         // CLI mode: run capture on main thread
         // Enable F2 watcher in CLI mode for keyboard control
         run_capture(Arc::clone(&events_arc), Arc::clone(&stop_flag), target_device, false)?;
-        
+
         // extract events for analysis and plotting
         let events = events_arc.lock().unwrap().clone();
 
