@@ -38,13 +38,14 @@ MouseTesterRust.exe -g -d 1.2.1
 ```
 
 The GUI provides:
-- **Real-time statistics** - Event count, duration, distance, speed
-- **Interactive plots** - Zoom, pan, and explore dx/dy movement over time
+- **Deferred Plotting** - Plots are rendered only after capture is stopped for better performance
+- **Real-time event counter** - See the number of events being captured live
+- **Interactive plots** - Zoom, pan, and explore dx/dy movement over time with Level of Detail (LOD)
 - **Histogram visualization** - Movement magnitude distribution
 - **Events table** - Detailed view of individual events
 - **Toggle controls** - Show/hide different visualization panels
 
-Press **F2** to stop recording and finalize the analysis. On Windows, F2 works globally even when the GUI window is not focused.
+Press **F2** to stop recording and display the analysis. On Windows, F2 works globally even when the GUI window is not focused. The plot will be drawn only after you press F2, which improves performance during capture.
 
 ### CLI Mode (Traditional)
 
@@ -75,8 +76,9 @@ Without specifying `-d`, the program will print all detected mouse events to hel
 ## Output
 
 ### GUI Mode
-- Real-time visualization in the application window
-- All statistics and plots updated live as events are captured
+- Event counter updates in real-time during capture
+- Statistics and plots are displayed after pressing F2 to stop capture
+- Plots use Level of Detail (LOD) for better performance with large datasets
 
 ### CLI Mode
 - `output.csv` - CSV file containing:
