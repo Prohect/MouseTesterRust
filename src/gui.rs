@@ -1,5 +1,6 @@
 use eframe::egui;
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+use std::thread;
 use crate::MouseMoveEvent;
 
 #[cfg(windows)]
@@ -15,10 +16,23 @@ pub struct MouseAnalyzerGui {
     is_capturing: bool,
     captured_events: Vec<MouseMoveEvent>, // Events snapshot when capture stopped
     last_f2_state: bool, // For edge detection
+    target_device: Option<crate::TargetDevice>, // Store target device for restarts
+    // LOD state for intelligent updates
+    cached_lod_events: Vec<MouseMoveEvent>,
+    last_plot_bounds: Option<PlotBounds>,
+    lod_threshold: f64, // Threshold for triggering LOD recalculation (0.1 = 10% change)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PlotBounds {
+    x_min: f64,
+    x_max: f64,
+    y_min: f64,
+    y_max: f64,
 }
 
 impl MouseAnalyzerGui {
-    pub fn new(events: Arc<Mutex<Vec<MouseMoveEvent>>>, stop_flag: Arc<AtomicBool>) -> Self {
+    pub fn new(events: Arc<Mutex<Vec<MouseMoveEvent>>>, stop_flag: Arc<AtomicBool>, target_device: Option<crate::TargetDevice>) -> Self {
         Self {
             events,
             stop_flag,
@@ -29,6 +43,42 @@ impl MouseAnalyzerGui {
             is_capturing: true, // Start capturing initially
             captured_events: Vec::new(),
             last_f2_state: false,
+            target_device,
+            cached_lod_events: Vec::new(),
+            last_plot_bounds: None,
+            lod_threshold: 0.1, // 10% change threshold
+        }
+    }
+    
+    /// Check if plot bounds have changed significantly
+    fn bounds_changed_significantly(&self, new_bounds: &PlotBounds) -> bool {
+        match self.last_plot_bounds {
+            None => true, // First time, always recalculate
+            Some(old_bounds) => {
+                let x_range_old = (old_bounds.x_max - old_bounds.x_min).abs();
+                let y_range_old = (old_bounds.y_max - old_bounds.y_min).abs();
+                let x_range_new = (new_bounds.x_max - new_bounds.x_min).abs();
+                let y_range_new = (new_bounds.y_max - new_bounds.y_min).abs();
+                
+                // Check if range changed by more than threshold
+                let x_change = ((x_range_new - x_range_old) / x_range_old.max(1e-6)).abs();
+                let y_change = ((y_range_new - y_range_old) / y_range_old.max(1e-6)).abs();
+                
+                // Also check if center position moved significantly
+                let x_center_old = (old_bounds.x_min + old_bounds.x_max) / 2.0;
+                let x_center_new = (new_bounds.x_min + new_bounds.x_max) / 2.0;
+                let y_center_old = (old_bounds.y_min + old_bounds.y_max) / 2.0;
+                let y_center_new = (new_bounds.y_min + new_bounds.y_max) / 2.0;
+                
+                let x_center_change = ((x_center_new - x_center_old) / x_range_old.max(1e-6)).abs();
+                let y_center_change = ((y_center_new - y_center_old) / y_range_old.max(1e-6)).abs();
+                
+                // Trigger if any change exceeds threshold
+                x_change > self.lod_threshold || 
+                y_change > self.lod_threshold ||
+                x_center_change > self.lod_threshold ||
+                y_center_change > self.lod_threshold
+            }
         }
     }
 
@@ -88,9 +138,9 @@ impl MouseAnalyzerGui {
         }
     }
 
-    /// Downsample events for LOD based on zoom level
+    /// Downsample events for LOD based on zoom level and visible range
     /// Returns a subset of events when there are many points to improve rendering performance
-    fn apply_lod(&self, events: &[MouseMoveEvent], visible_width: f64) -> Vec<MouseMoveEvent> {
+    fn apply_lod(&self, events: &[MouseMoveEvent], visible_width: f64, plot_bounds: Option<&PlotBounds>) -> Vec<MouseMoveEvent> {
         if events.is_empty() {
             return Vec::new();
         }
@@ -99,16 +149,28 @@ impl MouseAnalyzerGui {
         // If we have more points than pixels, we should downsample
         let target_points = (visible_width * 2.0) as usize; // 2 points per pixel is plenty
         
-        if events.len() <= target_points {
+        // If plot bounds are available, filter events to visible range first
+        let visible_events: Vec<MouseMoveEvent> = if let Some(bounds) = plot_bounds {
+            events.iter()
+                .filter(|e| {
+                    e.time >= bounds.x_min && e.time <= bounds.x_max
+                })
+                .copied()
+                .collect()
+        } else {
+            events.to_vec()
+        };
+        
+        if visible_events.len() <= target_points {
             // No need to downsample
-            return events.to_vec();
+            return visible_events;
         }
 
         // Downsample by taking every nth point
-        let step = events.len() / target_points;
+        let step = visible_events.len() / target_points;
         let step = step.max(1);
         
-        events.iter()
+        visible_events.iter()
             .step_by(step)
             .copied()
             .collect()
@@ -141,12 +203,39 @@ impl eframe::App for MouseAnalyzerGui {
         let f2_just_pressed = f2_pressed_now && !self.last_f2_state;
         self.last_f2_state = f2_pressed_now;
 
-        // Handle F2 key press - stop capture and take snapshot
-        if f2_just_pressed && self.is_capturing {
-            println!("F2 pressed: stopping capture and drawing plot...");
-            self.stop_flag.store(true, Ordering::SeqCst);
-            self.captured_events = self.events.lock().unwrap().clone();
-            self.is_capturing = false;
+        // Handle F2 key press
+        if f2_just_pressed {
+            if self.is_capturing {
+                // Stop current capture and take snapshot
+                println!("F2 pressed: stopping capture and drawing plot...");
+                self.stop_flag.store(true, Ordering::SeqCst);
+                self.captured_events = self.events.lock().unwrap().clone();
+                self.is_capturing = false;
+                // Clear LOD cache since we have new data
+                self.cached_lod_events.clear();
+                self.last_plot_bounds = None;
+            } else {
+                // Start a new capture
+                println!("F2 pressed: starting new capture...");
+                // Clear previous data
+                self.events.lock().unwrap().clear();
+                self.captured_events.clear();
+                self.cached_lod_events.clear();
+                self.last_plot_bounds = None;
+                // Reset stop flag and restart capture
+                self.stop_flag.store(false, Ordering::SeqCst);
+                self.is_capturing = true;
+                
+                // Spawn new capture thread
+                let events_capture = Arc::clone(&self.events);
+                let stop_capture = Arc::clone(&self.stop_flag);
+                let target_device = self.target_device;
+                thread::spawn(move || {
+                    if let Err(e) = crate::run_capture(events_capture, stop_capture, target_device) {
+                        eprintln!("Capture error: {}", e);
+                    }
+                });
+            }
         }
 
         // Only request repaint if we're capturing (to show live event count)
@@ -203,7 +292,7 @@ impl eframe::App for MouseAnalyzerGui {
             } else {
                 ui.colored_label(egui::Color32::RED, "● Stopped");
                 ui.label(format!("{} events total", stats.count));
-                ui.label("Analysis complete");
+                ui.label("Press F2 to start new capture");
             }
         });
 
@@ -286,32 +375,61 @@ impl eframe::App for MouseAnalyzerGui {
                             // Get screen width for LOD calculation
                             let available_width = ui.available_width();
                             
-                            // Apply LOD to reduce point count for better performance
-                            let lod_events = self.apply_lod(&display_events, available_width as f64);
-                            
-                            let dx_points: PlotPoints = lod_events
-                                .iter()
-                                .map(|e| [e.time, e.dx as f64])
-                                .collect();
-                            let dx_line = Line::new(dx_points)
-                                .color(egui::Color32::from_rgb(255, 0, 0))
-                                .name("dx");
-
-                            let ndy_points: PlotPoints = lod_events
-                                .iter()
-                                .map(|e| [e.time, -(e.dy as f64)])
-                                .collect();
-                            let ndy_line = Line::new(ndy_points)
-                                .color(egui::Color32::from_rgb(0, 0, 255))
-                                .name("-dy");
-
-                            Plot::new("mouse_plot")
+                            // Show the plot and capture its response to get bounds
+                            let plot_response = Plot::new("mouse_plot")
                                 .view_aspect(2.0)
                                 .legend(egui_plot::Legend::default())
                                 .show(ui, |plot_ui| {
+                                    // Get current plot bounds
+                                    let bounds = plot_ui.plot_bounds();
+                                    let current_bounds = PlotBounds {
+                                        x_min: bounds.min()[0],
+                                        x_max: bounds.max()[0],
+                                        y_min: bounds.min()[1],
+                                        y_max: bounds.max()[1],
+                                    };
+                                    
+                                    // Check if we need to recalculate LOD
+                                    let needs_lod_update = self.bounds_changed_significantly(&current_bounds) ||
+                                                          self.cached_lod_events.is_empty();
+                                    
+                                    let lod_events = if needs_lod_update {
+                                        // Recalculate LOD with current bounds
+                                        self.apply_lod(&display_events, available_width as f64, Some(&current_bounds))
+                                    } else {
+                                        // Use cached LOD events
+                                        self.cached_lod_events.clone()
+                                    };
+                                    
+                                    // Build plot lines
+                                    let dx_points: PlotPoints = lod_events
+                                        .iter()
+                                        .map(|e| [e.time, e.dx as f64])
+                                        .collect();
+                                    let dx_line = Line::new(dx_points)
+                                        .color(egui::Color32::from_rgb(255, 0, 0))
+                                        .name("dx");
+
+                                    let ndy_points: PlotPoints = lod_events
+                                        .iter()
+                                        .map(|e| [e.time, -(e.dy as f64)])
+                                        .collect();
+                                    let ndy_line = Line::new(ndy_points)
+                                        .color(egui::Color32::from_rgb(0, 0, 255))
+                                        .name("-dy");
+
                                     plot_ui.line(dx_line);
                                     plot_ui.line(ndy_line);
+                                    
+                                    (current_bounds, lod_events, needs_lod_update)
                                 });
+                            
+                            // Update cached values if LOD was recalculated
+                            let (current_bounds, lod_events, needs_lod_update) = plot_response.inner;
+                            if needs_lod_update {
+                                self.cached_lod_events = lod_events.clone();
+                                self.last_plot_bounds = Some(current_bounds);
+                            }
                             
                             // Show LOD info if downsampling occurred
                             if lod_events.len() < display_events.len() {
@@ -402,7 +520,7 @@ impl eframe::App for MouseAnalyzerGui {
     }
 }
 
-pub fn run_gui(events: Arc<Mutex<Vec<MouseMoveEvent>>>, stop_flag: Arc<AtomicBool>) -> Result<(), eframe::Error> {
+pub fn run_gui(events: Arc<Mutex<Vec<MouseMoveEvent>>>, stop_flag: Arc<AtomicBool>, target_device: Option<crate::TargetDevice>) -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 800.0])
@@ -413,7 +531,7 @@ pub fn run_gui(events: Arc<Mutex<Vec<MouseMoveEvent>>>, stop_flag: Arc<AtomicBoo
     eframe::run_native(
         "Mouse Event Analyzer",
         options,
-        Box::new(move |_cc| Box::new(MouseAnalyzerGui::new(events, stop_flag))),
+        Box::new(move |_cc| Box::new(MouseAnalyzerGui::new(events, stop_flag, target_device))),
     )
 }
 
@@ -434,7 +552,8 @@ mod tests {
     fn test_stats_calculation() {
         let gui = MouseAnalyzerGui::new(
             Arc::new(Mutex::new(vec![])), 
-            Arc::new(AtomicBool::new(false))
+            Arc::new(AtomicBool::new(false)),
+            None
         );
         let events = create_test_events();
         let stats = gui.calculate_stats(&events);
@@ -453,7 +572,8 @@ mod tests {
     fn test_empty_events() {
         let gui = MouseAnalyzerGui::new(
             Arc::new(Mutex::new(vec![])), 
-            Arc::new(AtomicBool::new(false))
+            Arc::new(AtomicBool::new(false)),
+            None
         );
         let stats = gui.calculate_stats(&[]);
         
@@ -467,7 +587,8 @@ mod tests {
     fn test_histogram_generation() {
         let gui = MouseAnalyzerGui::new(
             Arc::new(Mutex::new(vec![])), 
-            Arc::new(AtomicBool::new(false))
+            Arc::new(AtomicBool::new(false)),
+            None
         );
         let events = create_test_events();
         let stats = gui.calculate_stats(&events);
@@ -483,12 +604,13 @@ mod tests {
     fn test_lod_no_downsampling() {
         let gui = MouseAnalyzerGui::new(
             Arc::new(Mutex::new(vec![])), 
-            Arc::new(AtomicBool::new(false))
+            Arc::new(AtomicBool::new(false)),
+            None
         );
         let events = create_test_events();
         
         // With large visible width, no downsampling should occur
-        let lod_events = gui.apply_lod(&events, 1000.0);
+        let lod_events = gui.apply_lod(&events, 1000.0, None);
         assert_eq!(lod_events.len(), events.len());
     }
 
@@ -496,7 +618,8 @@ mod tests {
     fn test_lod_with_downsampling() {
         let gui = MouseAnalyzerGui::new(
             Arc::new(Mutex::new(vec![])), 
-            Arc::new(AtomicBool::new(false))
+            Arc::new(AtomicBool::new(false)),
+            None
         );
         
         // Create many events
@@ -510,7 +633,7 @@ mod tests {
         }
         
         // With small visible width, downsampling should occur
-        let lod_events = gui.apply_lod(&many_events, 100.0);
+        let lod_events = gui.apply_lod(&many_events, 100.0, None);
         
         // Should be downsampled (target is 2 * visible_width = 200)
         assert!(lod_events.len() < many_events.len());
@@ -521,10 +644,149 @@ mod tests {
     fn test_lod_empty_events() {
         let gui = MouseAnalyzerGui::new(
             Arc::new(Mutex::new(vec![])), 
-            Arc::new(AtomicBool::new(false))
+            Arc::new(AtomicBool::new(false)),
+            None
         );
         
-        let lod_events = gui.apply_lod(&[], 100.0);
+        let lod_events = gui.apply_lod(&[], 100.0, None);
         assert_eq!(lod_events.len(), 0);
+    }
+    
+    #[test]
+    fn test_lod_with_bounds_filtering() {
+        let gui = MouseAnalyzerGui::new(
+            Arc::new(Mutex::new(vec![])), 
+            Arc::new(AtomicBool::new(false)),
+            None
+        );
+        
+        // Create events with times from 0.0 to 9.9
+        let mut events = Vec::new();
+        for i in 0..100 {
+            events.push(MouseMoveEvent { 
+                dx: (i % 10) as i16, 
+                dy: (i % 5) as i16, 
+                time: i as f64 * 0.1 
+            });
+        }
+        
+        // Create bounds that only include times 2.0 to 5.0
+        let bounds = PlotBounds {
+            x_min: 2.0,
+            x_max: 5.0,
+            y_min: -10.0,
+            y_max: 10.0,
+        };
+        
+        let lod_events = gui.apply_lod(&events, 1000.0, Some(&bounds));
+        
+        // Should only include events within the bounds
+        assert!(lod_events.len() < events.len());
+        for event in &lod_events {
+            assert!(event.time >= 2.0 && event.time <= 5.0);
+        }
+    }
+    
+    #[test]
+    fn test_bounds_changed_significantly_first_time() {
+        let gui = MouseAnalyzerGui::new(
+            Arc::new(Mutex::new(vec![])), 
+            Arc::new(AtomicBool::new(false)),
+            None
+        );
+        
+        let bounds = PlotBounds {
+            x_min: 0.0,
+            x_max: 10.0,
+            y_min: -5.0,
+            y_max: 5.0,
+        };
+        
+        // First time should always return true
+        assert!(gui.bounds_changed_significantly(&bounds));
+    }
+    
+    #[test]
+    fn test_bounds_changed_significantly_small_change() {
+        let mut gui = MouseAnalyzerGui::new(
+            Arc::new(Mutex::new(vec![])), 
+            Arc::new(AtomicBool::new(false)),
+            None
+        );
+        
+        let initial_bounds = PlotBounds {
+            x_min: 0.0,
+            x_max: 10.0,
+            y_min: -5.0,
+            y_max: 5.0,
+        };
+        gui.last_plot_bounds = Some(initial_bounds);
+        
+        // Very small change (5% zoom)
+        let new_bounds = PlotBounds {
+            x_min: 0.25,
+            x_max: 9.75,
+            y_min: -4.75,
+            y_max: 4.75,
+        };
+        
+        // Should not trigger with default 10% threshold
+        assert!(!gui.bounds_changed_significantly(&new_bounds));
+    }
+    
+    #[test]
+    fn test_bounds_changed_significantly_large_zoom() {
+        let mut gui = MouseAnalyzerGui::new(
+            Arc::new(Mutex::new(vec![])), 
+            Arc::new(AtomicBool::new(false)),
+            None
+        );
+        
+        let initial_bounds = PlotBounds {
+            x_min: 0.0,
+            x_max: 10.0,
+            y_min: -5.0,
+            y_max: 5.0,
+        };
+        gui.last_plot_bounds = Some(initial_bounds);
+        
+        // Large zoom change (50% zoom in)
+        let new_bounds = PlotBounds {
+            x_min: 2.5,
+            x_max: 7.5,
+            y_min: -2.5,
+            y_max: 2.5,
+        };
+        
+        // Should trigger update
+        assert!(gui.bounds_changed_significantly(&new_bounds));
+    }
+    
+    #[test]
+    fn test_bounds_changed_significantly_pan() {
+        let mut gui = MouseAnalyzerGui::new(
+            Arc::new(Mutex::new(vec![])), 
+            Arc::new(AtomicBool::new(false)),
+            None
+        );
+        
+        let initial_bounds = PlotBounds {
+            x_min: 0.0,
+            x_max: 10.0,
+            y_min: -5.0,
+            y_max: 5.0,
+        };
+        gui.last_plot_bounds = Some(initial_bounds);
+        
+        // Significant pan (more than 10% of range)
+        let new_bounds = PlotBounds {
+            x_min: 2.0,
+            x_max: 12.0,
+            y_min: -5.0,
+            y_max: 5.0,
+        };
+        
+        // Should trigger update
+        assert!(gui.bounds_changed_significantly(&new_bounds));
     }
 }
