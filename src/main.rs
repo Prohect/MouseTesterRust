@@ -314,13 +314,17 @@ pub fn run_capture(
         .spawn()
         .map_err(|e| anyhow!("Failed to start USBPcapCMD: {}", e))?;
 
-    let child_pid = child.id().to_string();
+    // Extract stdout before moving child into Arc
+    let stdout = child.stdout.take().ok_or_else(|| anyhow!("Failed to capture stdout"))?;
+
+    // Put child in Arc<Mutex<>> for shared access
+    let child_arc = Arc::new(Mutex::new(child));
 
     // Keyboard watcher thread (Windows: GetAsyncKeyState). On F2 it will try to stop the capture.
     // Only start this thread if not disabled (e.g., when GUI is handling F2 separately)
     if !disable_f2_watcher {
         let stop_flag = Arc::clone(&stop_flag);
-        let _pid = child_pid.clone();
+        let child_for_watcher = Arc::clone(&child_arc);
         thread::spawn(move || {
             loop {
                 if stop_flag.load(AtomicOrdering::SeqCst) {
@@ -331,8 +335,10 @@ pub fn run_capture(
                     if key_utils::is_f2_pressed() {
                         println!("F2 pressed: requesting stop...");
                         stop_flag.store(true, AtomicOrdering::SeqCst);
-                        // try to stop the child so pipe unblocks
-                        let _ = Command::new("taskkill").args(&["/PID", &_pid, "/F"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+                        // Kill the child directly using the shared handle
+                        if let Ok(mut child) = child_for_watcher.lock() {
+                            let _ = child.kill();
+                        }
                         break;
                     }
                 }
@@ -342,7 +348,6 @@ pub fn run_capture(
     }
 
     // reader loop, collect events
-    let stdout = child.stdout.take().ok_or_else(|| anyhow!("Failed to capture stdout"))?;
     let mut reader = BufReader::new(stdout);
     let mut buffer = Vec::<u8>::with_capacity(262144);
     let mut temp = vec![0u8; 65535];
@@ -424,8 +429,13 @@ pub fn run_capture(
     }
 
     // ensure child stopped
-    child.kill().ok();
-    child.wait().ok();
+    match child_arc.lock() {
+        Ok(mut child) => {
+            child.kill().ok();
+            child.wait().ok();
+        }
+        Err(_) => {}
+    };
 
     Ok(())
 }
