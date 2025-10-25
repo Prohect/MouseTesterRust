@@ -478,4 +478,53 @@ mod tests {
         let total_in_histogram: usize = stats.histogram.iter().sum();
         assert_eq!(total_in_histogram, events.len());
     }
+
+    #[test]
+    fn test_lod_no_downsampling() {
+        let gui = MouseAnalyzerGui::new(
+            Arc::new(Mutex::new(vec![])), 
+            Arc::new(AtomicBool::new(false))
+        );
+        let events = create_test_events();
+        
+        // With large visible width, no downsampling should occur
+        let lod_events = gui.apply_lod(&events, 1000.0);
+        assert_eq!(lod_events.len(), events.len());
+    }
+
+    #[test]
+    fn test_lod_with_downsampling() {
+        let gui = MouseAnalyzerGui::new(
+            Arc::new(Mutex::new(vec![])), 
+            Arc::new(AtomicBool::new(false))
+        );
+        
+        // Create many events
+        let mut many_events = Vec::new();
+        for i in 0..1000 {
+            many_events.push(MouseMoveEvent { 
+                dx: (i % 10) as i16, 
+                dy: (i % 5) as i16, 
+                time: i as f64 * 0.01 
+            });
+        }
+        
+        // With small visible width, downsampling should occur
+        let lod_events = gui.apply_lod(&many_events, 100.0);
+        
+        // Should be downsampled (target is 2 * visible_width = 200)
+        assert!(lod_events.len() < many_events.len());
+        assert!(lod_events.len() > 0);
+    }
+
+    #[test]
+    fn test_lod_empty_events() {
+        let gui = MouseAnalyzerGui::new(
+            Arc::new(Mutex::new(vec![])), 
+            Arc::new(AtomicBool::new(false))
+        );
+        
+        let lod_events = gui.apply_lod(&[], 100.0);
+        assert_eq!(lod_events.len(), 0);
+    }
 }
