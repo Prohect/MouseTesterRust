@@ -17,9 +17,12 @@ pub struct MouseAnalyzerGui {
     captured_events: Vec<MouseMoveEvent>, // Events snapshot when capture stopped
     last_f2_state: bool, // For edge detection
     target_device: Option<crate::TargetDevice>, // Store target device for restarts
-    // LOD state for intelligent updates
-    cached_lod_events: Vec<MouseMoveEvent>,
+    // LOD state for intelligent updates (indices-based)
+    cached_lod_indices: Vec<usize>,
+    lod_pyramid: Vec<Vec<usize>>, // Lazy LOD pyramid for fast lookups
     last_plot_bounds: Option<PlotBounds>,
+    last_target_points: Option<usize>, // Track target_points for coarsen-from-previous
+    last_events_len: usize, // For cache invalidation on capture reset
     lod_threshold: f64, // Threshold for triggering LOD recalculation (0.1 = 10% change)
 }
 
@@ -44,8 +47,11 @@ impl MouseAnalyzerGui {
             captured_events: Vec::new(),
             last_f2_state: false,
             target_device,
-            cached_lod_events: Vec::new(),
+            cached_lod_indices: Vec::new(),
+            lod_pyramid: Vec::new(),
             last_plot_bounds: None,
+            last_target_points: None,
+            last_events_len: 0,
             lod_threshold: 0.1, // 10% change threshold
         }
     }
@@ -80,6 +86,146 @@ impl MouseAnalyzerGui {
                 y_center_change > self.lod_threshold
             }
         }
+    }
+
+    /// Indices-based LOD pipeline for improved performance with static captures
+    /// Returns indices into the events slice instead of cloning events
+    fn apply_lod_indices(
+        &mut self,
+        events: &[MouseMoveEvent],
+        visible_width: f64,
+        plot_bounds: Option<&PlotBounds>,
+    ) -> Vec<usize> {
+        use std::collections::HashSet;
+        
+        if events.is_empty() {
+            return Vec::new();
+        }
+
+        // Check if cache needs invalidation due to events change
+        if events.len() != self.last_events_len {
+            self.cached_lod_indices.clear();
+            self.lod_pyramid.clear();
+            self.last_target_points = None;
+            self.last_events_len = events.len();
+        }
+
+        // Constants for tuning
+        const MARGIN_PX: f64 = 8.0;
+        const COLINEARITY_TOL: f64 = 0.6;
+
+        // Calculate target points (2 points per pixel)
+        let target_points = (visible_width * 2.0) as usize;
+
+        // Binary search to find visible slice
+        let (start_idx, end_idx) = if let Some(bounds) = plot_bounds {
+            // Add margin in time units
+            let time_range = bounds.x_max - bounds.x_min;
+            let margin_time = if time_range > 0.0 {
+                (MARGIN_PX / visible_width) * time_range
+            } else {
+                0.0
+            };
+
+            let x_min_with_margin = bounds.x_min - margin_time;
+            let x_max_with_margin = bounds.x_max + margin_time;
+
+            // Use partition_point for binary search
+            let start = events.partition_point(|e| e.time < x_min_with_margin);
+            let end = events.partition_point(|e| e.time <= x_max_with_margin);
+
+            (start, end)
+        } else {
+            (0, events.len())
+        };
+
+        let visible_count = end_idx.saturating_sub(start_idx);
+
+        if visible_count == 0 {
+            return Vec::new();
+        }
+
+        if visible_count <= target_points {
+            // No downsampling needed
+            return (start_idx..end_idx).collect();
+        }
+
+        // Check for coarsen-from-previous fast path (zooming out)
+        if let Some(last_target) = self.last_target_points {
+            if target_points < last_target && !self.cached_lod_indices.is_empty() {
+                // Coarsen from cached indices
+                let step = self.cached_lod_indices.len() / target_points.max(1);
+                let step = step.max(1);
+                
+                let coarsened: Vec<usize> = self.cached_lod_indices
+                    .iter()
+                    .step_by(step)
+                    .copied()
+                    .collect();
+                
+                self.last_target_points = Some(target_points);
+                return coarsened;
+            }
+        }
+
+        // Full LOD computation with trend preservation
+        let mut selected_indices = Vec::with_capacity(target_points);
+        let mut dedup_set = HashSet::new();
+
+        // Calculate bucket size
+        let bucket_size = visible_count / target_points.max(1);
+        let bucket_size = bucket_size.max(1);
+
+        for bucket_start in (start_idx..end_idx).step_by(bucket_size) {
+            let bucket_end = (bucket_start + bucket_size).min(end_idx);
+
+            if bucket_start >= bucket_end {
+                continue;
+            }
+
+            // Collect indices for this bucket with trend preservation
+            // Include first and last of bucket
+            let first_idx = bucket_start;
+            let last_idx = bucket_end - 1;
+
+            // Find min/max dx and dy in bucket
+            let mut min_dx_idx = first_idx;
+            let mut max_dx_idx = first_idx;
+            let mut min_dy_idx = first_idx;
+            let mut max_dy_idx = first_idx;
+
+            for idx in bucket_start..bucket_end {
+                if events[idx].dx < events[min_dx_idx].dx {
+                    min_dx_idx = idx;
+                }
+                if events[idx].dx > events[max_dx_idx].dx {
+                    max_dx_idx = idx;
+                }
+                if events[idx].dy < events[min_dy_idx].dy {
+                    min_dy_idx = idx;
+                }
+                if events[idx].dy > events[max_dy_idx].dy {
+                    max_dy_idx = idx;
+                }
+            }
+
+            // Add unique indices using time deduplication
+            for &idx in &[first_idx, last_idx, min_dx_idx, max_dx_idx, min_dy_idx, max_dy_idx] {
+                let time_bits = events[idx].time.to_bits();
+                if dedup_set.insert(time_bits) {
+                    selected_indices.push(idx);
+                }
+            }
+        }
+
+        // Sort indices to maintain time order
+        selected_indices.sort_unstable();
+
+        // Update cache
+        self.cached_lod_indices = selected_indices.clone();
+        self.last_target_points = Some(target_points);
+
+        selected_indices
     }
 
     fn calculate_stats(&self, events: &[MouseMoveEvent]) -> Stats {
@@ -137,44 +283,6 @@ impl MouseAnalyzerGui {
             bucket_size,
         }
     }
-
-    /// Downsample events for LOD based on zoom level and visible range
-    /// Returns a subset of events when there are many points to improve rendering performance
-    fn apply_lod(&self, events: &[MouseMoveEvent], visible_width: f64, plot_bounds: Option<&PlotBounds>) -> Vec<MouseMoveEvent> {
-        if events.is_empty() {
-            return Vec::new();
-        }
-
-        // Calculate points per pixel as a heuristic for LOD
-        // If we have more points than pixels, we should downsample
-        let target_points = (visible_width * 2.0) as usize; // 2 points per pixel is plenty
-        
-        // If plot bounds are available, filter events to visible range first
-        let visible_events: Vec<MouseMoveEvent> = if let Some(bounds) = plot_bounds {
-            events.iter()
-                .filter(|e| {
-                    e.time >= bounds.x_min && e.time <= bounds.x_max
-                })
-                .copied()
-                .collect()
-        } else {
-            events.to_vec()
-        };
-        
-        if visible_events.len() <= target_points {
-            // No need to downsample
-            return visible_events;
-        }
-
-        // Downsample by taking every nth point
-        let step = visible_events.len() / target_points;
-        let step = step.max(1);
-        
-        visible_events.iter()
-            .step_by(step)
-            .copied()
-            .collect()
-    }
 }
 
 #[derive(Default)]
@@ -212,16 +320,22 @@ impl eframe::App for MouseAnalyzerGui {
                 self.captured_events = self.events.lock().unwrap().clone();
                 self.is_capturing = false;
                 // Clear LOD cache since we have new data
-                self.cached_lod_events.clear();
+                self.cached_lod_indices.clear();
+                self.lod_pyramid.clear();
                 self.last_plot_bounds = None;
+                self.last_target_points = None;
+                self.last_events_len = self.captured_events.len();
             } else {
                 // Start a new capture
                 println!("F2 pressed: starting new capture...");
                 // Clear previous data
                 self.events.lock().unwrap().clear();
                 self.captured_events.clear();
-                self.cached_lod_events.clear();
+                self.cached_lod_indices.clear();
+                self.lod_pyramid.clear();
                 self.last_plot_bounds = None;
+                self.last_target_points = None;
+                self.last_events_len = 0;
                 // Reset stop flag and restart capture
                 self.stop_flag.store(false, Ordering::SeqCst);
                 self.is_capturing = true;
@@ -392,28 +506,40 @@ impl eframe::App for MouseAnalyzerGui {
                                     
                                     // Check if we need to recalculate LOD
                                     let needs_lod_update = self.bounds_changed_significantly(&current_bounds) ||
-                                                          self.cached_lod_events.is_empty();
+                                                          self.cached_lod_indices.is_empty();
                                     
-                                    let lod_events = if needs_lod_update {
+                                    let lod_indices = if needs_lod_update {
                                         // Recalculate LOD with current bounds
-                                        self.apply_lod(&display_events, available_width as f64, Some(&current_bounds))
+                                        self.apply_lod_indices(&display_events, available_width as f64, Some(&current_bounds))
                                     } else {
-                                        // Use cached LOD events
-                                        self.cached_lod_events.clone()
+                                        // Use cached LOD indices
+                                        self.cached_lod_indices.clone()
                                     };
                                     
-                                    // Build plot lines
-                                    let dx_points: PlotPoints = lod_events
+                                    // Build plot lines by mapping indices to events
+                                    let dx_points: PlotPoints = lod_indices
                                         .iter()
-                                        .map(|e| [e.time, e.dx as f64])
+                                        .filter_map(|&idx| {
+                                            if idx < display_events.len() {
+                                                Some([display_events[idx].time, display_events[idx].dx as f64])
+                                            } else {
+                                                None
+                                            }
+                                        })
                                         .collect();
                                     let dx_line = Line::new(dx_points)
                                         .color(egui::Color32::from_rgb(255, 0, 0))
                                         .name("dx");
 
-                                    let ndy_points: PlotPoints = lod_events
+                                    let ndy_points: PlotPoints = lod_indices
                                         .iter()
-                                        .map(|e| [e.time, -(e.dy as f64)])
+                                        .filter_map(|&idx| {
+                                            if idx < display_events.len() {
+                                                Some([display_events[idx].time, -(display_events[idx].dy as f64)])
+                                            } else {
+                                                None
+                                            }
+                                        })
                                         .collect();
                                     let ndy_line = Line::new(ndy_points)
                                         .color(egui::Color32::from_rgb(0, 0, 255))
@@ -422,20 +548,20 @@ impl eframe::App for MouseAnalyzerGui {
                                     plot_ui.line(dx_line);
                                     plot_ui.line(ndy_line);
                                     
-                                    (current_bounds, lod_events, needs_lod_update)
+                                    (current_bounds, lod_indices, needs_lod_update)
                                 });
                             
                             // Update cached values if LOD was recalculated
-                            let (current_bounds, lod_events, needs_lod_update) = plot_response.inner;
+                            let (current_bounds, lod_indices, needs_lod_update) = plot_response.inner;
                             if needs_lod_update {
-                                self.cached_lod_events = lod_events.clone();
+                                self.cached_lod_indices = lod_indices.clone();
                                 self.last_plot_bounds = Some(current_bounds);
                             }
                             
                             // Show LOD info if downsampling occurred
-                            if lod_events.len() < display_events.len() {
+                            if lod_indices.len() < display_events.len() {
                                 ui.label(format!("Showing {} of {} points (LOD applied)", 
-                                    lod_events.len(), display_events.len()));
+                                    lod_indices.len(), display_events.len()));
                             }
                         });
                         ui.add_space(10.0);
@@ -602,8 +728,8 @@ mod tests {
     }
 
     #[test]
-    fn test_lod_no_downsampling() {
-        let gui = MouseAnalyzerGui::new(
+    fn test_lod_indices_no_downsampling() {
+        let mut gui = MouseAnalyzerGui::new(
             Arc::new(Mutex::new(vec![])), 
             Arc::new(AtomicBool::new(false)),
             None
@@ -611,13 +737,18 @@ mod tests {
         let events = create_test_events();
         
         // With large visible width, no downsampling should occur
-        let lod_events = gui.apply_lod(&events, 1000.0, None);
-        assert_eq!(lod_events.len(), events.len());
+        let lod_indices = gui.apply_lod_indices(&events, 1000.0, None);
+        assert_eq!(lod_indices.len(), events.len());
+        
+        // Indices should be in order
+        for (i, &idx) in lod_indices.iter().enumerate() {
+            assert_eq!(idx, i);
+        }
     }
 
     #[test]
-    fn test_lod_with_downsampling() {
-        let gui = MouseAnalyzerGui::new(
+    fn test_lod_indices_with_downsampling() {
+        let mut gui = MouseAnalyzerGui::new(
             Arc::new(Mutex::new(vec![])), 
             Arc::new(AtomicBool::new(false)),
             None
@@ -634,28 +765,39 @@ mod tests {
         }
         
         // With small visible width, downsampling should occur
-        let lod_events = gui.apply_lod(&many_events, 100.0, None);
+        let lod_indices = gui.apply_lod_indices(&many_events, 100.0, None);
         
         // Should be downsampled (target is 2 * visible_width = 200)
-        assert!(lod_events.len() < many_events.len());
-        assert!(lod_events.len() > 0);
+        assert!(lod_indices.len() < many_events.len());
+        assert!(lod_indices.len() > 0);
+        assert!(lod_indices.len() <= 200 * 6); // Max 6 points per bucket (first/last + min/max dx/dy)
+        
+        // Indices should be sorted
+        for i in 1..lod_indices.len() {
+            assert!(lod_indices[i] >= lod_indices[i-1]);
+        }
+        
+        // All indices should be valid
+        for &idx in &lod_indices {
+            assert!(idx < many_events.len());
+        }
     }
 
     #[test]
-    fn test_lod_empty_events() {
-        let gui = MouseAnalyzerGui::new(
+    fn test_lod_indices_empty_events() {
+        let mut gui = MouseAnalyzerGui::new(
             Arc::new(Mutex::new(vec![])), 
             Arc::new(AtomicBool::new(false)),
             None
         );
         
-        let lod_events = gui.apply_lod(&[], 100.0, None);
-        assert_eq!(lod_events.len(), 0);
+        let lod_indices = gui.apply_lod_indices(&[], 100.0, None);
+        assert_eq!(lod_indices.len(), 0);
     }
     
     #[test]
-    fn test_lod_with_bounds_filtering() {
-        let gui = MouseAnalyzerGui::new(
+    fn test_lod_indices_with_bounds_filtering() {
+        let mut gui = MouseAnalyzerGui::new(
             Arc::new(Mutex::new(vec![])), 
             Arc::new(AtomicBool::new(false)),
             None
@@ -679,12 +821,15 @@ mod tests {
             y_max: 10.0,
         };
         
-        let lod_events = gui.apply_lod(&events, 1000.0, Some(&bounds));
+        let lod_indices = gui.apply_lod_indices(&events, 1000.0, Some(&bounds));
         
-        // Should only include events within the bounds
-        assert!(lod_events.len() < events.len());
-        for event in &lod_events {
-            assert!(event.time >= 2.0 && event.time <= 5.0);
+        // Should only include events within the bounds (with margin)
+        assert!(lod_indices.len() < events.len());
+        for &idx in &lod_indices {
+            let event_time = events[idx].time;
+            // Account for margin (8px worth of time)
+            assert!(event_time >= 1.9 && event_time <= 5.1, 
+                "Event time {} outside expected range", event_time);
         }
     }
     
@@ -789,5 +934,152 @@ mod tests {
         
         // Should trigger update
         assert!(gui.bounds_changed_significantly(&new_bounds));
+    }
+    
+    #[test]
+    fn test_lod_performance_64k() {
+        let mut gui = MouseAnalyzerGui::new(
+            Arc::new(Mutex::new(vec![])), 
+            Arc::new(AtomicBool::new(false)),
+            None
+        );
+        
+        // Create 64,000 synthetic events with patterns
+        let mut events = Vec::new();
+        for i in 0..64_000 {
+            events.push(MouseMoveEvent {
+                dx: ((i % 100) as i16) - 50, // Pattern from -50 to 49
+                dy: ((i % 50) as i16) - 25,   // Pattern from -25 to 24
+                time: i as f64 * 0.001,        // Time increasing: 0.0 to 63.999s
+            });
+        }
+        
+        // Simulate a visible window covering a portion of the time range
+        let bounds = PlotBounds {
+            x_min: 10.0,
+            x_max: 20.0,
+            y_min: -100.0,
+            y_max: 100.0,
+        };
+        
+        let visible_width = 1000.0;
+        let target_points = (visible_width * 2.0) as usize;
+        
+        let lod_indices = gui.apply_lod_indices(&events, visible_width, Some(&bounds));
+        
+        // Verify returned indices count is reasonable
+        assert!(lod_indices.len() > 0, "Should return some indices");
+        assert!(lod_indices.len() <= target_points * 6, "Should not exceed max possible indices");
+        
+        // Verify all indices are within bounds
+        for &idx in &lod_indices {
+            assert!(idx < events.len(), "Index {} out of bounds", idx);
+        }
+        
+        // Verify indices are sorted by time (should be sorted by index)
+        for i in 1..lod_indices.len() {
+            assert!(lod_indices[i] >= lod_indices[i-1], "Indices should be sorted");
+            assert!(events[lod_indices[i]].time >= events[lod_indices[i-1]].time, 
+                "Events should be sorted by time");
+        }
+        
+        // Verify events are within visible bounds (with margin)
+        for &idx in &lod_indices {
+            let event_time = events[idx].time;
+            // With margin, should be approximately within bounds
+            assert!(event_time >= 9.9 && event_time <= 20.1, 
+                "Event time {} should be approximately within bounds", event_time);
+        }
+    }
+    
+    #[test]
+    fn test_lod_coarsen_from_previous() {
+        let mut gui = MouseAnalyzerGui::new(
+            Arc::new(Mutex::new(vec![])), 
+            Arc::new(AtomicBool::new(false)),
+            None
+        );
+        
+        // Create test events
+        let mut events = Vec::new();
+        for i in 0..10_000 {
+            events.push(MouseMoveEvent {
+                dx: (i % 50) as i16,
+                dy: (i % 30) as i16,
+                time: i as f64 * 0.001,
+            });
+        }
+        
+        // First call with large visible width (less aggressive LOD)
+        let visible_width_1 = 2000.0;
+        let indices_1 = gui.apply_lod_indices(&events, visible_width_1, None);
+        let count_1 = indices_1.len();
+        
+        // Second call with smaller visible width (more aggressive LOD - zooming out)
+        let visible_width_2 = 500.0;
+        let indices_2 = gui.apply_lod_indices(&events, visible_width_2, None);
+        let count_2 = indices_2.len();
+        
+        // Should use coarsen-from-previous path and return fewer points
+        assert!(count_2 < count_1, 
+            "Second call should return fewer indices (coarser): {} vs {}", count_2, count_1);
+        assert!(count_2 > 0, "Should still return some indices");
+        
+        // Verify indices are still sorted
+        for i in 1..indices_2.len() {
+            assert!(indices_2[i] >= indices_2[i-1]);
+        }
+        
+        // Third call with even smaller width
+        let visible_width_3 = 100.0;
+        let indices_3 = gui.apply_lod_indices(&events, visible_width_3, None);
+        let count_3 = indices_3.len();
+        
+        // Should continue to get coarser
+        assert!(count_3 <= count_2, 
+            "Third call should return same or fewer indices: {} vs {}", count_3, count_2);
+    }
+    
+    #[test]
+    fn test_lod_cache_invalidation() {
+        let mut gui = MouseAnalyzerGui::new(
+            Arc::new(Mutex::new(vec![])), 
+            Arc::new(AtomicBool::new(false)),
+            None
+        );
+        
+        // Create initial events
+        let mut events = Vec::new();
+        for i in 0..1000 {
+            events.push(MouseMoveEvent {
+                dx: (i % 10) as i16,
+                dy: (i % 5) as i16,
+                time: i as f64 * 0.01,
+            });
+        }
+        
+        // First call to populate cache
+        let indices_1 = gui.apply_lod_indices(&events, 100.0, None);
+        assert!(!indices_1.is_empty());
+        assert!(!gui.cached_lod_indices.is_empty());
+        
+        // Create new events with different length (simulate capture reset)
+        let mut new_events = Vec::new();
+        for i in 0..500 {
+            new_events.push(MouseMoveEvent {
+                dx: (i % 15) as i16,
+                dy: (i % 8) as i16,
+                time: i as f64 * 0.02,
+            });
+        }
+        
+        // Call with new events - cache should be invalidated
+        let indices_2 = gui.apply_lod_indices(&new_events, 100.0, None);
+        
+        // Should work correctly with new data
+        assert!(!indices_2.is_empty());
+        for &idx in &indices_2 {
+            assert!(idx < new_events.len());
+        }
     }
 }
