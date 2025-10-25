@@ -99,7 +99,7 @@ impl UsbPcapHeader {
     }
 
     fn is_in_direction(&self) -> bool {
-        self.direction_in
+        self.info == 1u8
     }
 }
 
