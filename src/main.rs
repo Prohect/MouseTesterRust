@@ -15,6 +15,8 @@ use std::{
     time::Duration,
 };
 
+mod gui;
+
 #[derive(Debug)]
 #[allow(dead_code)]
 struct PcapRecordHeader {
@@ -121,10 +123,10 @@ fn parse_target_device(arg: &str) -> Result<TargetDevice> {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct MouseMoveEvent {
-    dx: i16,
-    dy: i16,
-    time: f64,
+pub struct MouseMoveEvent {
+    pub dx: i16,
+    pub dy: i16,
+    pub time: f64,
 }
 
 #[cfg(windows)]
@@ -296,23 +298,11 @@ fn analyze_and_write_csv_and_plot(events: &[MouseMoveEvent]) -> Result<()> {
     Ok(())
 }
 
-fn main() -> Result<()> {
-    // Shared event storage and stop flag
-    let events_arc: Arc<Mutex<Vec<MouseMoveEvent>>> = Arc::new(Mutex::new(Vec::new()));
-    let stop_flag = Arc::new(AtomicBool::new(false));
-
-    // parse args for optional target device
-    let args: Vec<String> = env::args().collect();
-    let mut target_device: Option<TargetDevice> = None;
-    let mut i = 0usize;
-    while i < args.len() {
-        if args[i] == "-d" && i + 1 < args.len() {
-            target_device = Some(parse_target_device(&args[i + 1])?);
-            i += 1;
-        }
-        i += 1;
-    }
-
+fn run_capture(
+    events_arc: Arc<Mutex<Vec<MouseMoveEvent>>>,
+    stop_flag: Arc<AtomicBool>,
+    target_device: Option<TargetDevice>,
+) -> Result<()> {
     println!("Filtering for target device: {:?}", target_device);
     println!("Starting USBPcapCMD for device {}", r"\\.\USBPcap1");
 
@@ -328,7 +318,7 @@ fn main() -> Result<()> {
     // Keyboard watcher thread (Windows: GetAsyncKeyState). On F2 it will try to stop the capture.
     {
         let stop_flag = Arc::clone(&stop_flag);
-        let pid = child_pid.clone();
+        let _pid = child_pid.clone();
         thread::spawn(move || {
             loop {
                 if stop_flag.load(AtomicOrdering::SeqCst) {
@@ -340,7 +330,7 @@ fn main() -> Result<()> {
                         println!("F2 pressed: requesting stop...");
                         stop_flag.store(true, AtomicOrdering::SeqCst);
                         // try to stop the child so pipe unblocks
-                        let _ = Command::new("taskkill").args(&["/PID", &pid, "/F"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+                        let _ = Command::new("taskkill").args(&["/PID", &_pid, "/F"]).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
                         break;
                     }
                 }
@@ -435,11 +425,54 @@ fn main() -> Result<()> {
     child.kill().ok();
     child.wait().ok();
 
-    // extract events for analysis and plotting
-    let events = events_arc.lock().unwrap().clone();
+    Ok(())
+}
 
-    // write CSV & print analysis, create PNG plot and open it
-    analyze_and_write_csv_and_plot(&events)?;
+fn main() -> Result<()> {
+    // Shared event storage and stop flag
+    let events_arc: Arc<Mutex<Vec<MouseMoveEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let stop_flag = Arc::new(AtomicBool::new(false));
+
+    // parse args for optional target device and gui flag
+    let args: Vec<String> = env::args().collect();
+    let mut target_device: Option<TargetDevice> = None;
+    let mut use_gui = false;
+    let mut i = 0usize;
+    while i < args.len() {
+        if args[i] == "-d" && i + 1 < args.len() {
+            target_device = Some(parse_target_device(&args[i + 1])?);
+            i += 1;
+        } else if args[i] == "--gui" || args[i] == "-g" {
+            use_gui = true;
+        }
+        i += 1;
+    }
+
+    if use_gui {
+        // GUI mode: run capture in background thread, GUI on main thread
+        let events_capture = Arc::clone(&events_arc);
+        let stop_capture = Arc::clone(&stop_flag);
+        thread::spawn(move || {
+            if let Err(e) = run_capture(events_capture, stop_capture, target_device) {
+                eprintln!("Capture error: {}", e);
+            }
+        });
+        
+        // Run GUI on main thread (required by eframe)
+        if let Err(e) = gui::run_gui(events_arc) {
+            eprintln!("GUI error: {}", e);
+            return Err(anyhow!("GUI failed: {}", e));
+        }
+    } else {
+        // CLI mode: run capture on main thread
+        run_capture(Arc::clone(&events_arc), Arc::clone(&stop_flag), target_device)?;
+        
+        // extract events for analysis and plotting
+        let events = events_arc.lock().unwrap().clone();
+
+        // write CSV & print analysis, create PNG plot and open it
+        analyze_and_write_csv_and_plot(&events)?;
+    }
 
     Ok(())
 }
