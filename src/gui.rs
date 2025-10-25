@@ -221,6 +221,10 @@ impl MouseAnalyzerGui {
         // Sort indices to maintain time order
         selected_indices.sort_unstable();
 
+        // Validate all indices are within bounds
+        debug_assert!(selected_indices.iter().all(|&idx| idx < events.len()),
+            "All indices should be within events bounds");
+
         // Update cache
         self.cached_lod_indices = selected_indices.clone();
         self.last_target_points = Some(target_points);
@@ -516,31 +520,27 @@ impl eframe::App for MouseAnalyzerGui {
                                         self.cached_lod_indices.clone()
                                     };
                                     
+                                    // Helper to safely map indices to plot points
+                                    let map_to_points = |indices: &[usize], map_fn: fn(&MouseMoveEvent) -> [f64; 2]| {
+                                        indices
+                                            .iter()
+                                            .filter_map(|&idx| {
+                                                if idx < display_events.len() {
+                                                    Some(map_fn(&display_events[idx]))
+                                                } else {
+                                                    None
+                                                }
+                                            })
+                                            .collect::<PlotPoints>()
+                                    };
+                                    
                                     // Build plot lines by mapping indices to events
-                                    let dx_points: PlotPoints = lod_indices
-                                        .iter()
-                                        .filter_map(|&idx| {
-                                            if idx < display_events.len() {
-                                                Some([display_events[idx].time, display_events[idx].dx as f64])
-                                            } else {
-                                                None
-                                            }
-                                        })
-                                        .collect();
+                                    let dx_points = map_to_points(&lod_indices, |e| [e.time, e.dx as f64]);
                                     let dx_line = Line::new(dx_points)
                                         .color(egui::Color32::from_rgb(255, 0, 0))
                                         .name("dx");
 
-                                    let ndy_points: PlotPoints = lod_indices
-                                        .iter()
-                                        .filter_map(|&idx| {
-                                            if idx < display_events.len() {
-                                                Some([display_events[idx].time, -(display_events[idx].dy as f64)])
-                                            } else {
-                                                None
-                                            }
-                                        })
-                                        .collect();
+                                    let ndy_points = map_to_points(&lod_indices, |e| [e.time, -(e.dy as f64)]);
                                     let ndy_line = Line::new(ndy_points)
                                         .color(egui::Color32::from_rgb(0, 0, 255))
                                         .name("-dy");
