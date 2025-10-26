@@ -21,7 +21,7 @@ fn main() {
     for i in 0..num_events {
         let t = i as f64 / 10.0; // Time in seconds (0.1s intervals)
         let ts_sec = t.floor() as u32;
-        let ts_usec = ((t.fract() * 1_000_000.0) as u32);
+        let ts_usec = (t.fract() * 1_000_000.0) as u32;
 
         // Create a sinusoidal pattern for dx and dy
         let dx = (50.0 * (t * 0.5).sin()) as i16;
