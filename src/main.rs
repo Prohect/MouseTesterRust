@@ -16,33 +16,10 @@ use std::{
 };
 
 mod gui;
+pub mod lod;
+pub mod mouse_event;
 
-#[derive(Debug)]
-#[allow(dead_code)]
-struct PcapRecordHeader {
-    ts_sec: u32,
-    ts_usec: u32,
-    incl_len: u32,
-    orig_len: u32,
-}
-
-impl PcapRecordHeader {
-    fn parse(data: &[u8]) -> Option<(Self, usize)> {
-        if data.len() < 16 {
-            return None;
-        }
-        let mut cur = Cursor::new(data);
-        Some((
-            PcapRecordHeader {
-                ts_sec: cur.read_u32::<LittleEndian>().ok()?,
-                ts_usec: cur.read_u32::<LittleEndian>().ok()?,
-                incl_len: cur.read_u32::<LittleEndian>().ok()?,
-                orig_len: cur.read_u32::<LittleEndian>().ok()?,
-            },
-            16,
-        ))
-    }
-}
+use mouse_event::{MouseMoveEvent, PcapRecordHeader};
 
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -120,13 +97,6 @@ fn parse_target_device(arg: &str) -> Result<TargetDevice> {
         device_address: u16::from_str(parts[1])?,
         endpoint: u8::from_str(parts[2])?,
     })
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct MouseMoveEvent {
-    pub dx: i16,
-    pub dy: i16,
-    pub time: f64,
 }
 
 #[cfg(windows)]
@@ -207,8 +177,8 @@ fn analyze_and_write_csv_and_plot(events: &[MouseMoveEvent]) -> Result<()> {
     }
 
     let count = events.len();
-    let time_start = events.iter().map(|e| e.time).fold(f64::INFINITY, |a, b| a.min(b));
-    let time_end = events.iter().map(|e| e.time).fold(f64::NEG_INFINITY, |a, b| a.max(b));
+    let time_start = events.iter().map(|e| e.time_secs()).fold(f64::INFINITY, |a, b| a.min(b));
+    let time_end = events.iter().map(|e| e.time_secs()).fold(f64::NEG_INFINITY, |a, b| a.max(b));
     let duration = (time_end - time_start).max(0.0);
 
     let total_dx: i64 = events.iter().map(|e| e.dx as i64).sum();
@@ -267,7 +237,7 @@ fn analyze_and_write_csv_and_plot(events: &[MouseMoveEvent]) -> Result<()> {
     let mut f = OpenOptions::new().write(true).truncate(true).create(true).open("output.csv")?;
     writeln!(f, "dx,dy,time")?;
     for e in events {
-        writeln!(f, "{},{},{:.6}", e.dx, e.dy, e.time)?;
+        writeln!(f, "{},{},{:.6}", e.dx, e.dy, e.time_secs())?;
     }
     writeln!(f, "\n# Summary")?;
     writeln!(f, "# Count,{},TimeSpan(s),{:.6}", count, duration)?;
@@ -278,7 +248,7 @@ fn analyze_and_write_csv_and_plot(events: &[MouseMoveEvent]) -> Result<()> {
     println!("\nWrote detailed events + summary to output.csv");
 
     // Prepare PNG plot and open it in the system default viewer
-    let times_plot: Vec<f64> = events.iter().map(|e| e.time).collect();
+    let times_plot: Vec<f64> = events.iter().map(|e| e.time_secs()).collect();
     let dx_plot: Vec<f64> = events.iter().map(|e| e.dx as f64).collect();
     let ndy_plot: Vec<f64> = events.iter().map(|e| -(e.dy as f64)).collect();
     let png_path = "mouse_plot.png";
@@ -346,7 +316,7 @@ pub fn run_capture(events_arc: Arc<Mutex<Vec<MouseMoveEvent>>>, stop_flag: Arc<A
     let mut reader = BufReader::new(stdout);
     let mut buffer = Vec::<u8>::with_capacity(262144);
     let mut temp = vec![0u8; 65535];
-    let mut first_target_ts: Option<f64> = None;
+    let mut first_target_ts: Option<(u32, u32)> = None; // Store (ts_sec, ts_usec) as base
     let mut skipped_global = false;
 
     println!("Reading USB data from pipe... (press F2 to stop capture and analyze)");
@@ -396,43 +366,65 @@ pub fn run_capture(events_arc: Arc<Mutex<Vec<MouseMoveEvent>>>, stop_flag: Arc<A
                     if usb_hdr.data_length == 8 && payload.len() >= 8 {
                         if let Some(td) = target_device {
                             if td.bus_id == usb_hdr.bus_id && td.device_address == usb_hdr.device_address && td.endpoint == usb_hdr.endpoint {
-                                let ts = rec_hdr.ts_sec as f64 + rec_hdr.ts_usec as f64 / 1_000_000.0;
-                                let delta = if let Some(start) = first_target_ts {
-                                    ts - start
+                                // Calculate relative timestamp
+                                let (rel_sec, rel_usec) = if let Some((base_sec, base_usec)) = first_target_ts {
+                                    // Compute relative time
+                                    let mut sec_diff = rec_hdr.ts_sec as i64 - base_sec as i64;
+                                    let mut usec_diff = rec_hdr.ts_usec as i64 - base_usec as i64;
+
+                                    if usec_diff < 0 {
+                                        sec_diff -= 1;
+                                        usec_diff += 1_000_000;
+                                    }
+
+                                    (sec_diff as u32, usec_diff as u32)
                                 } else {
-                                    first_target_ts = Some(ts);
-                                    0.0
+                                    first_target_ts = Some((rec_hdr.ts_sec, rec_hdr.ts_usec));
+                                    (0, 0)
                                 };
-                                let dx = i16::from_le_bytes(payload[2..4].try_into().unwrap());
-                                let dy = i16::from_le_bytes(payload[4..6].try_into().unwrap());
-                                let mut events = events_arc.lock().unwrap();
-                                events.push(MouseMoveEvent { dx, dy, time: delta });
+
+                                if let Some(event) = mouse_event::parser::parse_with_report_id(payload, &rec_hdr) {
+                                    let mut events = events_arc.lock().unwrap();
+                                    // Create event with relative timestamp
+                                    events.push(MouseMoveEvent::new(event.dx, event.dy, rel_sec, rel_usec));
+                                }
                             }
                         } else {
                             // no target specified, just print sample debug
-                            let dx = i16::from_le_bytes(payload[2..4].try_into().unwrap());
-                            let dy = i16::from_le_bytes(payload[4..6].try_into().unwrap());
-                            println!("?Mouse Move: dx={:<4} dy={:<4} raw={:02X?}", dx, dy, payload);
+                            if let Some(event) = mouse_event::parser::parse_with_report_id(payload, &rec_hdr) {
+                                println!("?Mouse Move: dx={:<4} dy={:<4} raw={:02X?}", event.dx, event.dy, payload);
+                            }
                         }
                     } else if usb_hdr.data_length == 7 && payload.len() >= 7 {
                         if let Some(td) = target_device {
                             if td.bus_id == usb_hdr.bus_id && td.device_address == usb_hdr.device_address && td.endpoint == usb_hdr.endpoint {
-                                let ts = rec_hdr.ts_sec as f64 + rec_hdr.ts_usec as f64 / 1_000_000.0;
-                                let delta = if let Some(start) = first_target_ts {
-                                    ts - start
+                                // Calculate relative timestamp
+                                let (rel_sec, rel_usec) = if let Some((base_sec, base_usec)) = first_target_ts {
+                                    // Compute relative time
+                                    let mut sec_diff = rec_hdr.ts_sec as i64 - base_sec as i64;
+                                    let mut usec_diff = rec_hdr.ts_usec as i64 - base_usec as i64;
+
+                                    if usec_diff < 0 {
+                                        sec_diff -= 1;
+                                        usec_diff += 1_000_000;
+                                    }
+
+                                    (sec_diff as u32, usec_diff as u32)
                                 } else {
-                                    first_target_ts = Some(ts);
-                                    0.0
+                                    first_target_ts = Some((rec_hdr.ts_sec, rec_hdr.ts_usec));
+                                    (0, 0)
                                 };
-                                let dx = i16::from_le_bytes(payload[1..3].try_into().unwrap());
-                                let dy = i16::from_le_bytes(payload[3..5].try_into().unwrap());
-                                let mut events = events_arc.lock().unwrap();
-                                events.push(MouseMoveEvent { dx, dy, time: delta });
-                            } else {
-                                // no target specified, just print sample debug
-                                let dx = i16::from_le_bytes(payload[2..4].try_into().unwrap());
-                                let dy = i16::from_le_bytes(payload[4..6].try_into().unwrap());
-                                println!("?Mouse Move: dx={:<4} dy={:<4} raw={:02X?}", dx, dy, payload);
+
+                                if let Some(event) = mouse_event::parser::parse_without_report_id(payload, &rec_hdr) {
+                                    let mut events = events_arc.lock().unwrap();
+                                    // Create event with relative timestamp
+                                    events.push(MouseMoveEvent::new(event.dx, event.dy, rel_sec, rel_usec));
+                                }
+                            }
+                        } else {
+                            // no target specified, just print sample debug
+                            if let Some(event) = mouse_event::parser::parse_without_report_id(payload, &rec_hdr) {
+                                println!("?Mouse Move: dx={:<4} dy={:<4} raw={:02X?}", event.dx, event.dy, payload);
                             }
                         }
                     }

@@ -1,4 +1,4 @@
-use crate::MouseMoveEvent;
+use crate::mouse_event::MouseMoveEvent;
 use eframe::egui;
 use std::sync::{
     Arc, Mutex,
@@ -122,8 +122,8 @@ impl MouseAnalyzerGui {
             let x_max_with_margin = bounds.x_max + margin_time;
 
             // Use partition_point for binary search
-            let start = events.partition_point(|e| e.time < x_min_with_margin);
-            let end = events.partition_point(|e| e.time <= x_max_with_margin);
+            let start = events.partition_point(|e| e.time_secs() < x_min_with_margin);
+            let end = events.partition_point(|e| e.time_secs() <= x_max_with_margin);
 
             (start, end)
         } else {
@@ -198,7 +198,7 @@ impl MouseAnalyzerGui {
 
             // Add unique indices using time deduplication
             for &idx in &[first_idx, last_idx, min_dx_idx, max_dx_idx, min_dy_idx, max_dy_idx] {
-                let time_bits = events[idx].time.to_bits();
+                let time_bits = events[idx].time_secs().to_bits();
                 if dedup_set.insert(time_bits) {
                     selected_indices.push(idx);
                 }
@@ -224,8 +224,8 @@ impl MouseAnalyzerGui {
         }
 
         let count = events.len();
-        let time_start = events.iter().map(|e| e.time).fold(f64::INFINITY, |a, b| a.min(b));
-        let time_end = events.iter().map(|e| e.time).fold(f64::NEG_INFINITY, |a, b| a.max(b));
+        let time_start = events.iter().map(|e| e.time_secs()).fold(f64::INFINITY, |a, b| a.min(b));
+        let time_end = events.iter().map(|e| e.time_secs()).fold(f64::NEG_INFINITY, |a, b| a.max(b));
         let duration = (time_end - time_start).max(0.0);
 
         let total_dx: i64 = events.iter().map(|e| e.dx as i64).sum();
@@ -502,10 +502,10 @@ impl eframe::App for MouseAnalyzerGui {
                                 let map_to_points = |indices: &[usize], map_fn: fn(&MouseMoveEvent) -> [f64; 2]| indices.iter().filter_map(|&idx| if idx < display_events.len() { Some(map_fn(&display_events[idx])) } else { None }).collect::<PlotPoints>();
 
                                 // Build plot lines by mapping indices to events
-                                let dx_points = map_to_points(&lod_indices, |e| [e.time, e.dx as f64]);
+                                let dx_points = map_to_points(&lod_indices, |e| [e.time_secs(), e.dx as f64]);
                                 let dx_line = Line::new(dx_points).color(egui::Color32::from_rgb(255, 0, 0)).name("dx");
 
-                                let ndy_points = map_to_points(&lod_indices, |e| [e.time, -(e.dy as f64)]);
+                                let ndy_points = map_to_points(&lod_indices, |e| [e.time_secs(), -(e.dy as f64)]);
                                 let ndy_line = Line::new(ndy_points).color(egui::Color32::from_rgb(0, 0, 255)).name("-dy");
 
                                 plot_ui.line(dx_line);
@@ -572,7 +572,7 @@ impl eframe::App for MouseAnalyzerGui {
                                         ui.label(format!("{}", idx));
                                         ui.label(format!("{}", event.dx));
                                         ui.label(format!("{}", event.dy));
-                                        ui.label(format!("{:.6}", event.time));
+                                        ui.label(format!("{:.6}", event.time_secs()));
                                         ui.end_row();
                                     }
                                 });
