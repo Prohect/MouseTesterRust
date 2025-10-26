@@ -105,11 +105,12 @@ impl MouseAnalyzerGui {
             self.last_events_len = events.len();
         }
 
-        // Constants for tuning
+        // Constants for tuning - optimized based on real mouse capture analysis
         const MARGIN_PX: f64 = 8.0;
         const COLINEARITY_TOL: f64 = 0.6;
-        const MIN_POINTS_PER_PIXEL: f64 = 1.0; // Minimum to preserve detail
+        const MIN_POINTS_PER_PIXEL: f64 = 0.5; // Minimum for 8kHz+ high-density devices
         const MAX_POINTS_PER_PIXEL: f64 = 3.0; // Maximum when zoomed in
+        const HIGH_DENSITY_THRESHOLD: f64 = 5.0; // Threshold for aggressive reduction
 
         // Binary search to find visible slice
         let (start_idx, end_idx) = if let Some(bounds) = plot_bounds {
@@ -138,22 +139,27 @@ impl MouseAnalyzerGui {
         // Calculate target points based on data density and visible width
         // When many events are visible (zoomed out), reduce points per pixel
         // When few events are visible (zoomed in), use more points per pixel
+        // Optimized for 1kHz-8kHz mouse report rates based on real capture analysis
         let data_density = visible_count as f64 / visible_width;
 
         // Adaptive points per pixel based on data density
-        // High density (zoomed out) -> use fewer points per pixel (approach 1.0)
-        // Low density (zoomed in) -> use more points per pixel (approach 3.0)
-        let points_per_pixel = if data_density > MAX_POINTS_PER_PIXEL {
-            // Very high density: use minimum points per pixel
+        // Very high density (8kHz+, >5.0 events/pixel) -> 0.5 points/pixel
+        // High density (zoomed out, >3.0) -> 1.0 points/pixel
+        // Low density (zoomed in, <1.0) -> use all points
+        let points_per_pixel = if data_density > HIGH_DENSITY_THRESHOLD {
+            // Very high density (e.g., 8kHz sensor fully zoomed out): aggressive reduction
             MIN_POINTS_PER_PIXEL
-        } else if data_density < MIN_POINTS_PER_PIXEL {
+        } else if data_density > MAX_POINTS_PER_PIXEL {
+            // High density: use 1.0 points per pixel
+            1.0
+        } else if data_density < 1.0 {
             // Very low density: use all points (no downsampling)
             data_density
         } else {
-            // Medium density: scale between min and max
-            // As density increases, reduce points per pixel
-            let density_factor = (MAX_POINTS_PER_PIXEL - data_density) / (MAX_POINTS_PER_PIXEL - MIN_POINTS_PER_PIXEL);
-            MIN_POINTS_PER_PIXEL + density_factor * (MAX_POINTS_PER_PIXEL - MIN_POINTS_PER_PIXEL)
+            // Medium density: scale between 1.0 and 3.0 points per pixel
+            // As density increases from 1.0 to 3.0, reduce from 3.0 to 1.0 points/pixel
+            let density_factor = (MAX_POINTS_PER_PIXEL - data_density) / (MAX_POINTS_PER_PIXEL - 1.0);
+            1.0 + density_factor * (MAX_POINTS_PER_PIXEL - 1.0)
         };
 
         let target_points = (visible_width * points_per_pixel).max(visible_width * MIN_POINTS_PER_PIXEL) as usize;
