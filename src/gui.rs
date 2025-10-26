@@ -108,9 +108,8 @@ impl MouseAnalyzerGui {
         // Constants for tuning
         const MARGIN_PX: f64 = 8.0;
         const COLINEARITY_TOL: f64 = 0.6;
-
-        // Calculate target points (2 points per pixel)
-        let target_points = (visible_width * 2.0) as usize;
+        const MIN_POINTS_PER_PIXEL: f64 = 1.0; // Minimum to preserve detail
+        const MAX_POINTS_PER_PIXEL: f64 = 3.0; // Maximum when zoomed in
 
         // Binary search to find visible slice
         let (start_idx, end_idx) = if let Some(bounds) = plot_bounds {
@@ -135,6 +134,30 @@ impl MouseAnalyzerGui {
         if visible_count == 0 {
             return Vec::new();
         }
+
+        // Calculate target points based on data density and visible width
+        // When many events are visible (zoomed out), reduce points per pixel
+        // When few events are visible (zoomed in), use more points per pixel
+        let data_density = visible_count as f64 / visible_width;
+
+        // Adaptive points per pixel based on data density
+        // High density (zoomed out) -> use fewer points per pixel (approach 1.0)
+        // Low density (zoomed in) -> use more points per pixel (approach 3.0)
+        let points_per_pixel = if data_density > MAX_POINTS_PER_PIXEL {
+            // Very high density: use minimum points per pixel
+            MIN_POINTS_PER_PIXEL
+        } else if data_density < MIN_POINTS_PER_PIXEL {
+            // Very low density: use all points (no downsampling)
+            data_density
+        } else {
+            // Medium density: scale between min and max
+            // As density increases, reduce points per pixel
+            let density_factor = (MAX_POINTS_PER_PIXEL - data_density) / (MAX_POINTS_PER_PIXEL - MIN_POINTS_PER_PIXEL);
+            MIN_POINTS_PER_PIXEL + density_factor * (MAX_POINTS_PER_PIXEL - MIN_POINTS_PER_PIXEL)
+        };
+
+        let target_points = (visible_width * points_per_pixel).max(visible_width * MIN_POINTS_PER_PIXEL) as usize;
+        let target_points = target_points.min(visible_count); // Never exceed visible count
 
         if visible_count <= target_points {
             // No downsampling needed
@@ -523,7 +546,11 @@ impl eframe::App for MouseAnalyzerGui {
 
                             // Show LOD info if downsampling occurred
                             if lod_indices.len() < display_events.len() {
-                                ui.label(format!("Showing {} of {} points (LOD applied)", lod_indices.len(), display_events.len()));
+                                // Calculate reduction percentage
+                                let reduction = 100.0 * (1.0 - lod_indices.len() as f64 / display_events.len() as f64);
+                                ui.label(format!("LOD: Showing {} of {} points ({:.1}% reduction)", lod_indices.len(), display_events.len(), reduction));
+                            } else {
+                                ui.label(format!("Showing all {} points (no LOD)", display_events.len()));
                             }
                         });
                         ui.add_space(10.0);
