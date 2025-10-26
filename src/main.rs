@@ -392,26 +392,49 @@ pub fn run_capture(events_arc: Arc<Mutex<Vec<MouseMoveEvent>>>, stop_flag: Arc<A
             let record_data = &buffer[offset + rec_size..offset + rec_size + rec_hdr.incl_len as usize];
             if let Some((usb_hdr, usb_size)) = UsbPcapHeader::parse(record_data) {
                 let payload = &record_data[usb_size..];
-                if usb_hdr.is_in_direction() && usb_hdr.data_length == 8 && payload.len() >= 8 {
-                    if let Some(td) = target_device {
-                        if td.bus_id == usb_hdr.bus_id && td.device_address == usb_hdr.device_address && td.endpoint == usb_hdr.endpoint {
-                            let ts = rec_hdr.ts_sec as f64 + rec_hdr.ts_usec as f64 / 1_000_000.0;
-                            let delta = if let Some(start) = first_target_ts {
-                                ts - start
-                            } else {
-                                first_target_ts = Some(ts);
-                                0.0
-                            };
+                if usb_hdr.is_in_direction() {
+                    if usb_hdr.data_length == 8 && payload.len() >= 8 {
+                        if let Some(td) = target_device {
+                            if td.bus_id == usb_hdr.bus_id && td.device_address == usb_hdr.device_address && td.endpoint == usb_hdr.endpoint {
+                                let ts = rec_hdr.ts_sec as f64 + rec_hdr.ts_usec as f64 / 1_000_000.0;
+                                let delta = if let Some(start) = first_target_ts {
+                                    ts - start
+                                } else {
+                                    first_target_ts = Some(ts);
+                                    0.0
+                                };
+                                let dx = i16::from_le_bytes(payload[2..4].try_into().unwrap());
+                                let dy = i16::from_le_bytes(payload[4..6].try_into().unwrap());
+                                let mut events = events_arc.lock().unwrap();
+                                events.push(MouseMoveEvent { dx, dy, time: delta });
+                            }
+                        } else {
+                            // no target specified, just print sample debug
                             let dx = i16::from_le_bytes(payload[2..4].try_into().unwrap());
                             let dy = i16::from_le_bytes(payload[4..6].try_into().unwrap());
-                            let mut events = events_arc.lock().unwrap();
-                            events.push(MouseMoveEvent { dx, dy, time: delta });
+                            println!("?Mouse Move: dx={:<4} dy={:<4} raw={:02X?}", dx, dy, payload);
                         }
-                    } else {
-                        // no target specified, just print sample debug
-                        let dx = i16::from_le_bytes(payload[2..4].try_into().unwrap());
-                        let dy = i16::from_le_bytes(payload[4..6].try_into().unwrap());
-                        println!("?Mouse Move: dx={:<4} dy={:<4} raw={:02X?}", dx, dy, payload);
+                    } else if usb_hdr.data_length == 7 && payload.len() >= 7 {
+                        if let Some(td) = target_device {
+                            if td.bus_id == usb_hdr.bus_id && td.device_address == usb_hdr.device_address && td.endpoint == usb_hdr.endpoint {
+                                let ts = rec_hdr.ts_sec as f64 + rec_hdr.ts_usec as f64 / 1_000_000.0;
+                                let delta = if let Some(start) = first_target_ts {
+                                    ts - start
+                                } else {
+                                    first_target_ts = Some(ts);
+                                    0.0
+                                };
+                                let dx = i16::from_le_bytes(payload[1..3].try_into().unwrap());
+                                let dy = i16::from_le_bytes(payload[3..5].try_into().unwrap());
+                                let mut events = events_arc.lock().unwrap();
+                                events.push(MouseMoveEvent { dx, dy, time: delta });
+                            } else {
+                                // no target specified, just print sample debug
+                                let dx = i16::from_le_bytes(payload[2..4].try_into().unwrap());
+                                let dy = i16::from_le_bytes(payload[4..6].try_into().unwrap());
+                                println!("?Mouse Move: dx={:<4} dy={:<4} raw={:02X?}", dx, dy, payload);
+                            }
+                        }
                     }
                 }
             }
