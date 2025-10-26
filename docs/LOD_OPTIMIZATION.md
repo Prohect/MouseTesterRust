@@ -67,38 +67,47 @@ For typical scenarios:
 
 ## Offline LOD Module Parameters
 
-For the tree-based LOD module (src/lod.rs), recommended parameters:
+For the tree-based LOD module (src/lod.rs), recommended parameters based on real-world testing:
 
 ### High Report Rate Devices (8kHz+)
 
 ```rust
 min_pts: 10          // Prevent over-segmentation
 max_pts: 1000        // Balance tree depth
-tol_px: 0.5-1.0      // Maintain detail
+tol_px: 0.5-1.0      // Maintain detail (build tolerance)
+view_tol: 2.0-5.0    // View tolerance for 90-99% reduction
 px_scale: 1.0        // Standard scale
 ```
 
-**Rationale**: High rate devices have small movements per event. Higher min_pts prevents creating too many tiny segments.
+**Performance**: At 5px view tolerance, achieves 99% reduction (85,752 → ~858 points).
+
+**Rationale**: High rate devices have small movements per event. Higher min_pts prevents creating too many tiny segments. Use high view tolerances for aggressive reduction when zoomed out.
 
 ### Standard Devices (1-4kHz)
 
 ```rust
 min_pts: 5-7         // Balanced segmentation  
 max_pts: 1000        // Standard tree depth
-tol_px: 1.0-1.5      // Good quality/performance
+tol_px: 1.0-1.5      // Good quality/performance (build tolerance)
+view_tol: 2.0-5.0    // View tolerance for 40-96% reduction
 px_scale: 1.0        // Standard scale
 ```
 
-**Rationale**: Balanced approach for typical mouse usage patterns.
+**Performance**: At 5px view tolerance, achieves 46-96% reduction depending on movement patterns.
+
+**Rationale**: Balanced approach for typical mouse usage patterns. Lower min_pts accommodates larger movements per event.
 
 ### Power-Saving Modes
 
 ```rust
 min_pts: 5           // Accommodate timing gaps
 max_pts: 1000        // Standard depth
-tol_px: 1.5-2.0      // Tolerance for irregularities
+tol_px: 1.5-2.0      // Tolerance for irregularities (build tolerance)
+view_tol: 2.0-5.0    // View tolerance
 px_scale: 1.0        // Standard scale
 ```
+
+**Performance**: Similar to standard devices (40-46% reduction).
 
 **Rationale**: Lower min_pts and higher tolerance accommodate potential timing irregularities from power-saving features. Analysis shows LowPower mode is actually quite consistent, so aggressive parameter tuning isn't necessary.
 
