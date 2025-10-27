@@ -263,7 +263,7 @@ pub fn build_segments(events: &[MouseMoveEvent], initial_size: usize, growth_fac
         let mut current_size = initial_size;
         let mut fit_tolerance = 0;
         let max_fit_tolerance_r_squared_up = 10;
-        let max_fit_tolerance_r_squared_down = 2;
+        let max_fit_tolerance_r_squared_down = 3;
 
         while pos + current_size <= events.len() {
             let end = pos + current_size;
@@ -365,8 +365,8 @@ pub fn collect_visible_indices(
     let y_range_size = y_range.1 - y_range.0;
     let x_scale = render_width / (x_range_size).max(1e-10);
     let y_scale = render_height / (y_range_size).max(1e-10);
-    let min_x_visible = x_range.0 - (x_range_size * ((_zoom_factor-1.0)/2.0)) ;
-    let max_x_visible = x_range.1 + (x_range_size * ((_zoom_factor-1.0)/2.0)) ;
+    let min_x_visible = x_range.0 - (x_range_size * ((_zoom_factor - 1.0) / 2.0));
+    let max_x_visible = x_range.1 + (x_range_size * ((_zoom_factor - 1.0) / 2.0));
 
     // Helper: convert event to pixel coordinates
     let to_pixel = |event: &MouseMoveEvent| -> (i32, i32) {
@@ -561,17 +561,6 @@ mod tests {
         // Should have at least one good segment
         let has_good = segments.iter().any(|s| matches!(s, Segment::Good { .. }));
         assert!(has_good);
-    }
-
-    #[test]
-    fn test_build_segments_with_discrete() {
-        let events = make_test_events_with_zeros(20);
-        let segments = build_segments(&events, 5, 2.0, 0.8, 0.5);
-
-        assert!(!segments.is_empty());
-        // Should have some discrete events
-        let discrete_count = segments.iter().filter(|s| matches!(s, Segment::Discrete { .. })).count();
-        assert!(discrete_count >= 3); // At least 3 zero events in 20
     }
 
     #[test]

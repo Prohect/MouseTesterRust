@@ -28,6 +28,7 @@ pub struct MouseAnalyzerGui {
     // Error points detected by regression analysis (indices of events with high residuals)
     // Filtered to only show points between min_x_visible and max_x_visible
     advanced_lod_error_points: Vec<usize>,
+    advanced_lod_error_points_backup: Vec<usize>,
     advanced_lod_last_events_len: usize,
     advanced_lod_last_bounds: Option<PlotBounds>,
 }
@@ -46,7 +47,7 @@ impl MouseAnalyzerGui {
             events,
             stop_flag,
             show_plot: true,
-            show_stats: true,
+            show_stats: false,
             show_histogram: false,
             show_events_table: false,
             is_capturing: true, // Start capturing initially
@@ -57,6 +58,7 @@ impl MouseAnalyzerGui {
             // Advanced LOD initialization
             advanced_lod_segments: Vec::new(),
             advanced_lod_error_points: Vec::new(),
+            advanced_lod_error_points_backup: Vec::new(),
             advanced_lod_last_events_len: 0,
             advanced_lod_last_bounds: None,
         }
@@ -94,11 +96,10 @@ impl MouseAnalyzerGui {
 
     /// Calculate error points based on regression residuals
     /// Error is detected when: abs(y0-y1)/max(smallestPositive,abs(y1)) > (sqrt(1-r2)/k)
-    /// where k = 2.11, y0 is actual value, y1 is predicted value, r2 is R-squared
     fn calculate_error_points(&self, events: &[MouseMoveEvent]) -> Vec<usize> {
         let mut error_points = Vec::new();
-        const K: f64 = 2.11;
-        const SMALLEST_POSITIVE: f64 = 1e-6;
+        const K: f64 = 3.0;
+        const SMALLEST_POSITIVE: f64 = 1e-8;
 
         for segment in &self.advanced_lod_segments {
             if let Segment::Good { start_idx, end_idx, fit } = segment {
@@ -132,9 +133,9 @@ impl MouseAnalyzerGui {
                     let time_pred = fit.time_poly.eval(normalized_idx);
 
                     // Calculate error thresholds for each dimension
-                    let dx_threshold = (1.0 - fit.dx_r_squared).max(0.0).sqrt() / K;
-                    let dy_threshold = (1.0 - fit.dy_r_squared).max(0.0).sqrt() / K;
-                    let time_threshold = (1.0 - fit.time_r_squared).max(0.0).sqrt() / K;
+                    let dx_threshold = (1.0 - fit.dx_r_squared).max(0.0).sqrt() * K;
+                    let dy_threshold = (1.0 - fit.dy_r_squared).max(0.0).sqrt() * K;
+                    let time_threshold = (1.0 - fit.time_r_squared).max(0.0).sqrt() * K;
 
                     // Calculate relative errors
                     let dx_error = (dx_actual - dx_pred).abs() / dx_pred.abs().max(SMALLEST_POSITIVE);
@@ -164,14 +165,17 @@ impl MouseAnalyzerGui {
             println!("Building advanced LOD segments for {} events...", events.len());
             // Build segments with good parameters for real mouse data
             // - balance_weight: 0.091 (ln(len) is not and cant be normalized to 0.0 ~ 1.0)
-            self.advanced_lod_segments = build_segments(events, 10, 1.6, 0.8, 0.091);
+            self.advanced_lod_segments = build_segments(events, 10, 1.6, 0.98, 0.091);
             self.advanced_lod_last_events_len = events.len();
             println!("Created {} segments", self.advanced_lod_segments.len());
+            println!("Created {} discrete segments", self.advanced_lod_segments.iter().find(|&s| if let Segment::Discrete { idx: _ } = s {
+                true
+            }else{false}).iter().count());
 
             // Calculate error points after building segments
             let all_error_points = self.calculate_error_points(events);
             println!("Detected {} error points", all_error_points.len());
-            self.advanced_lod_error_points = all_error_points;
+            self.advanced_lod_error_points_backup = all_error_points;
         }
 
         // Get bounds or use full range
@@ -193,6 +197,7 @@ impl MouseAnalyzerGui {
         let max_x_visible = x_max + (x_range_size * ((zoom_factor - 1.0) / 2.0));
 
         // Filter error points to only those in visible range
+        self.advanced_lod_error_points = self.advanced_lod_error_points_backup.clone();
         self.advanced_lod_error_points.retain(|&idx| {
             if idx < events.len() {
                 let time = events[idx].time_secs();
