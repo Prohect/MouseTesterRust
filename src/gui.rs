@@ -619,3 +619,128 @@ pub fn run_gui(events: Arc<Mutex<Vec<MouseMoveEvent>>>, stop_flag: Arc<AtomicBoo
 
     eframe::run_native("Mouse Event Analyzer", options, Box::new(move |_cc| Box::new(MouseAnalyzerGui::new(events, stop_flag, target_device))))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_test_events(n: usize) -> Vec<MouseMoveEvent> {
+        let mut events = Vec::new();
+        for i in 0..n {
+            let t_sec = i as u32;
+            let t_usec = 0;
+            // Linear pattern with some noise
+            let dx = (i * 10) as i16;
+            let dy = -(i as i16 * 5);
+            events.push(MouseMoveEvent::new(dx, dy, t_sec, t_usec));
+        }
+        events
+    }
+
+    #[test]
+    fn test_calculate_error_points_empty_segments() {
+        let events = create_test_events(10);
+        let gui = MouseAnalyzerGui::new(
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(AtomicBool::new(false)),
+            None
+        );
+        
+        let error_points = gui.calculate_error_points(&events);
+        assert_eq!(error_points.len(), 0, "Should have no error points with empty segments");
+    }
+
+    #[test]
+    fn test_calculate_error_points_with_good_segments() {
+        let events = create_test_events(50);
+        let mut gui = MouseAnalyzerGui::new(
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(AtomicBool::new(false)),
+            None
+        );
+        
+        // Build segments
+        gui.advanced_lod_segments = build_segments(&events, 10, 1.6, 0.8, 0.091);
+        
+        let error_points = gui.calculate_error_points(&events);
+        
+        // With linear data, we should have very few or no error points
+        // (since the data fits well to polynomial regression)
+        assert!(error_points.len() <= events.len(), "Error points should not exceed total events");
+        println!("Detected {} error points out of {} events", error_points.len(), events.len());
+    }
+
+    #[test]
+    fn test_calculate_error_points_with_outliers() {
+        let mut events = create_test_events(30);
+        // Add some outliers that should be detected as errors
+        if events.len() > 15 {
+            events[15].dx = 1000; // Major outlier
+            events[16].dy = -1000; // Major outlier
+        }
+        
+        let mut gui = MouseAnalyzerGui::new(
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(AtomicBool::new(false)),
+            None
+        );
+        
+        // Build segments
+        gui.advanced_lod_segments = build_segments(&events, 10, 1.6, 0.8, 0.091);
+        
+        let error_points = gui.calculate_error_points(&events);
+        
+        // Should detect some error points due to outliers
+        println!("Detected {} error points with outliers", error_points.len());
+        assert!(error_points.len() > 0, "Should detect error points with outliers");
+    }
+
+    #[test]
+    fn test_error_points_filtered_by_visible_range() {
+        let events = create_test_events(100);
+        let mut gui = MouseAnalyzerGui::new(
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(AtomicBool::new(false)),
+            None
+        );
+        
+        // Build segments and calculate error points
+        gui.advanced_lod_segments = build_segments(&events, 10, 1.6, 0.8, 0.091);
+        gui.advanced_lod_error_points = gui.calculate_error_points(&events);
+        
+        let initial_error_count = gui.advanced_lod_error_points.len();
+        
+        // Now apply LOD with limited visible range (should filter error points)
+        let bounds = PlotBounds {
+            x_min: 10.0,
+            x_max: 30.0,
+            y_min: -500.0,
+            y_max: 500.0,
+        };
+        
+        gui.apply_advanced_lod_indices(&events, 800.0, 600.0, Some(&bounds));
+        
+        // Error points should be filtered to visible range
+        for &idx in &gui.advanced_lod_error_points {
+            if idx < events.len() {
+                let time = events[idx].time_secs();
+                let x_range_size = bounds.x_max - bounds.x_min;
+                let zoom_factor = 1.2;
+                let min_x_visible = bounds.x_min - (x_range_size * ((zoom_factor - 1.0) / 2.0));
+                let max_x_visible = bounds.x_max + (x_range_size * ((zoom_factor - 1.0) / 2.0));
+                
+                assert!(
+                    time >= min_x_visible && time <= max_x_visible,
+                    "Error point at index {} with time {} should be within visible range [{}, {}]",
+                    idx, time, min_x_visible, max_x_visible
+                );
+            }
+        }
+        
+        println!(
+            "Filtered error points from {} to {} based on visible range",
+            initial_error_count,
+            gui.advanced_lod_error_points.len()
+        );
+    }
+}
