@@ -25,13 +25,8 @@ pub struct MouseAnalyzerGui {
 
     // Advanced LOD state
     advanced_lod_segments: Vec<Segment>,
-    //TODO: use advanced_lod_segments to calculate and judge error points (any of dx, dy, time error then error) and store them in advanced_lod_error_points,
-    // these points will be shown as long as them are between min_x_visible and max_x_visible in func collect_visible_indices() in lod_advanced.rs
-    // the error judge algorithm should be :
-    // call the value y0; the value expected from regression y1; the r-squared from regression r2;
-    // abs(y0-y1)/max(smallestPositive,abs(y1)) > (sqrt(1-r2)/k), then judge this point as error point
-    // and let sey k may be 2.11
-    //
+    // Error points detected by regression analysis (indices of events with high residuals)
+    // Filtered to only show points between min_x_visible and max_x_visible
     advanced_lod_error_points: Vec<usize>,
     advanced_lod_last_events_len: usize,
     advanced_lod_last_bounds: Option<PlotBounds>,
@@ -97,6 +92,66 @@ impl MouseAnalyzerGui {
         }
     }
 
+    /// Calculate error points based on regression residuals
+    /// Error is detected when: abs(y0-y1)/max(smallestPositive,abs(y1)) > (sqrt(1-r2)/k)
+    /// where k = 2.11, y0 is actual value, y1 is predicted value, r2 is R-squared
+    fn calculate_error_points(&self, events: &[MouseMoveEvent]) -> Vec<usize> {
+        let mut error_points = Vec::new();
+        const K: f64 = 2.11;
+        const SMALLEST_POSITIVE: f64 = 1e-6;
+
+        for segment in &self.advanced_lod_segments {
+            if let Segment::Good { start_idx, end_idx, fit } = segment {
+                let n = end_idx - start_idx;
+                if n < 4 {
+                    continue;
+                }
+
+                // Normalize indices to [0, 1] for polynomial evaluation
+                let indices: Vec<f64> = (0..n).map(|i| i as f64).collect();
+                let max_idx = (n - 1) as f64;
+                let idx_norm: Vec<f64> = indices.iter().map(|&i| if max_idx > 0.0 { i / max_idx } else { 0.0 }).collect();
+
+                // Check each event in the segment
+                for (local_idx, &normalized_idx) in idx_norm.iter().enumerate() {
+                    let global_idx = start_idx + local_idx;
+                    if global_idx >= events.len() {
+                        continue;
+                    }
+
+                    let event = &events[global_idx];
+
+                    // Get actual values
+                    let dx_actual = event.dx as f64;
+                    let dy_actual = event.dy as f64;
+                    let time_actual = event.time_secs();
+
+                    // Get predicted values from polynomials
+                    let dx_pred = fit.dx_poly.eval(normalized_idx);
+                    let dy_pred = fit.dy_poly.eval(normalized_idx);
+                    let time_pred = fit.time_poly.eval(normalized_idx);
+
+                    // Calculate error thresholds for each dimension
+                    let dx_threshold = (1.0 - fit.dx_r_squared).max(0.0).sqrt() / K;
+                    let dy_threshold = (1.0 - fit.dy_r_squared).max(0.0).sqrt() / K;
+                    let time_threshold = (1.0 - fit.time_r_squared).max(0.0).sqrt() / K;
+
+                    // Calculate relative errors
+                    let dx_error = (dx_actual - dx_pred).abs() / dx_pred.abs().max(SMALLEST_POSITIVE);
+                    let dy_error = (dy_actual - dy_pred).abs() / dy_pred.abs().max(SMALLEST_POSITIVE);
+                    let time_error = (time_actual - time_pred).abs() / time_pred.abs().max(SMALLEST_POSITIVE);
+
+                    // Mark as error if any dimension exceeds threshold
+                    if dx_error > dx_threshold || dy_error > dy_threshold || time_error > time_threshold {
+                        error_points.push(global_idx);
+                    }
+                }
+            }
+        }
+
+        error_points
+    }
+
     /// NEW ADVANCED LOD: Apply the advanced LOD algorithm with regression-based segmentation
     /// Returns indices into the events slice for rendering
     fn apply_advanced_lod_indices(&mut self, events: &[MouseMoveEvent], visible_width: f64, visible_height: f64, plot_bounds: Option<&PlotBounds>) -> Vec<usize> {
@@ -112,6 +167,11 @@ impl MouseAnalyzerGui {
             self.advanced_lod_segments = build_segments(events, 10, 1.6, 0.8, 0.091);
             self.advanced_lod_last_events_len = events.len();
             println!("Created {} segments", self.advanced_lod_segments.len());
+
+            // Calculate error points after building segments
+            let all_error_points = self.calculate_error_points(events);
+            println!("Detected {} error points", all_error_points.len());
+            self.advanced_lod_error_points = all_error_points;
         }
 
         // Get bounds or use full range
@@ -125,6 +185,22 @@ impl MouseAnalyzerGui {
             let y_max = events.iter().map(|e| -(e.dy as f64)).fold(f64::NEG_INFINITY, f64::max);
             (x_min, x_max, y_min, y_max)
         };
+
+        // Calculate visible range with zoom factor
+        let x_range_size = x_max - x_min;
+        let zoom_factor = 1.2;
+        let min_x_visible = x_min - (x_range_size * ((zoom_factor - 1.0) / 2.0));
+        let max_x_visible = x_max + (x_range_size * ((zoom_factor - 1.0) / 2.0));
+
+        // Filter error points to only those in visible range
+        self.advanced_lod_error_points.retain(|&idx| {
+            if idx < events.len() {
+                let time = events[idx].time_secs();
+                time >= min_x_visible && time <= max_x_visible
+            } else {
+                false
+            }
+        });
 
         // Collect visible indices with advanced LOD
         // - tolerance: 3.0 (allow up to 3 events per pixel before hiding)
