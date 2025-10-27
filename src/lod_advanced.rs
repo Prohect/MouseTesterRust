@@ -256,19 +256,14 @@ pub fn build_segments(events: &[MouseMoveEvent], initial_size: usize, growth_fac
     let mut pos = 0;
 
     while pos < events.len() {
-        // Check if current event is discrete
-        if is_discrete_event(&events[pos]) {
-            segments.push(Segment::Discrete { idx: pos });
-            pos += 1;
-            continue;
-        }
-
         // Try progressively larger segments
         let mut best_fit: Option<SegmentFit> = None;
         let mut best_score = f64::NEG_INFINITY;
+        let mut best_r_squared = f64::NEG_INFINITY;
         let mut current_size = initial_size;
         let mut fit_tolerance = 0;
-        let max_fit_tolerance = 8;
+        let max_fit_tolerance_r_squared_up = 10;
+        let max_fit_tolerance_r_squared_down = 2;
 
         while pos + current_size <= events.len() {
             let end = pos + current_size;
@@ -278,7 +273,7 @@ pub fn build_segments(events: &[MouseMoveEvent], initial_size: usize, growth_fac
                 let avg_r_squared = (fit.dx_r_squared + fit.dy_r_squared + fit.time_r_squared) / 3.0;
 
                 // Only consider if all individual R-squared values are reasonable
-                if avg_r_squared >= min_r_squared && fit.time_r_squared >= min_r_squared * 0.8 {
+                if avg_r_squared >= min_r_squared && fit.time_r_squared >= min_r_squared * 0.7 {
                     // Score balances R-squared and segment length
                     // Higher balance_weight favors longer segments
                     let length_score = (current_size as f64).ln();
@@ -291,13 +286,24 @@ pub fn build_segments(events: &[MouseMoveEvent], initial_size: usize, growth_fac
                     }
                 } else {
                     // Fit quality degraded
-                    fit_tolerance += 1;
-                    if fit_tolerance > max_fit_tolerance {
-                        break;
+                    if avg_r_squared > best_r_squared {
+                        fit_tolerance += 1;
+                        if fit_tolerance > max_fit_tolerance_r_squared_up {
+                            break;
+                        }
+                    } else {
+                        fit_tolerance += 1;
+                        if fit_tolerance > max_fit_tolerance_r_squared_down {
+                            break;
+                        }
                     }
                 }
                 // Try larger segment
                 current_size = ((current_size as f64) * growth_factor).ceil() as usize;
+
+                if avg_r_squared > best_r_squared {
+                    best_r_squared = avg_r_squared;
+                }
             } else {
                 break;
             }

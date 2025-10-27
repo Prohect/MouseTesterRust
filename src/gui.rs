@@ -1,6 +1,6 @@
 use crate::mouse_event::MouseMoveEvent;
 // Import the new advanced LOD module
-use crate::lod_advanced::{build_segments, collect_visible_indices, Segment};
+use crate::lod_advanced::{Segment, build_segments, collect_visible_indices};
 use eframe::egui;
 use std::sync::{
     Arc, Mutex,
@@ -22,9 +22,17 @@ pub struct MouseAnalyzerGui {
     captured_events: Vec<MouseMoveEvent>,       // Events snapshot when capture stopped
     last_f2_state: bool,                        // For edge detection
     target_device: Option<crate::TargetDevice>, // Store target device for restarts
-    
+
     // Advanced LOD state
     advanced_lod_segments: Vec<Segment>,
+    //TODO: use advanced_lod_segments to calculate and judge error points (any of dx, dy, time error then error) and store them in advanced_lod_error_points,
+    // these points will be shown as long as them are between min_x_visible and max_x_visible in func collect_visible_indices() in lod_advanced.rs
+    // the error judge algorithm should be :
+    // call the value y0; the value expected from regression y1; the r-squared from regression r2;
+    // abs(y0-y1)/max(smallestPositive,abs(y1)) > (sqrt(1-r2)/k), then judge this point as error point
+    // and let sey k may be 2.11
+    //
+    advanced_lod_error_points: Vec<usize>,
     advanced_lod_last_events_len: usize,
     advanced_lod_last_bounds: Option<PlotBounds>,
 }
@@ -50,9 +58,10 @@ impl MouseAnalyzerGui {
             captured_events: Vec::new(),
             last_f2_state: false,
             target_device,
-            
+
             // Advanced LOD initialization
             advanced_lod_segments: Vec::new(),
+            advanced_lod_error_points: Vec::new(),
             advanced_lod_last_events_len: 0,
             advanced_lod_last_bounds: None,
         }
@@ -90,7 +99,7 @@ impl MouseAnalyzerGui {
 
     /// NEW ADVANCED LOD: Apply the advanced LOD algorithm with regression-based segmentation
     /// Returns indices into the events slice for rendering
-    fn apply_advanced_lod_indices(&mut self, events: &[MouseMoveEvent], visible_width: f64,visible_height: f64, plot_bounds: Option<&PlotBounds>) -> Vec<usize> {
+    fn apply_advanced_lod_indices(&mut self, events: &[MouseMoveEvent], visible_width: f64, visible_height: f64, plot_bounds: Option<&PlotBounds>) -> Vec<usize> {
         if events.is_empty() {
             return Vec::new();
         }
@@ -99,11 +108,8 @@ impl MouseAnalyzerGui {
         if events.len() != self.advanced_lod_last_events_len {
             println!("Building advanced LOD segments for {} events...", events.len());
             // Build segments with good parameters for real mouse data
-            // - initial_size: 15 (start with 15-event segments)
-            // - growth_factor: 2.0 (double size when expanding)
-            // - min_r_squared: 0.7 (require decent fit quality)
-            // - balance_weight: 0.25 (ln(len) is not and cant be normalized to 0.0 ~ 1.0)
-            self.advanced_lod_segments = build_segments(events, 15, 2.0, 0.7, 0.25);
+            // - balance_weight: 0.091 (ln(len) is not and cant be normalized to 0.0 ~ 1.0)
+            self.advanced_lod_segments = build_segments(events, 10, 1.6, 0.8, 0.091);
             self.advanced_lod_last_events_len = events.len();
             println!("Created {} segments", self.advanced_lod_segments.len());
         }
@@ -122,7 +128,7 @@ impl MouseAnalyzerGui {
 
         // Collect visible indices with advanced LOD
         // - tolerance: 3.0 (allow up to 3 events per pixel before hiding)
-        // - zoom_factor: 1.2 
+        // - zoom_factor: 1.2
         let indices = collect_visible_indices(
             &self.advanced_lod_segments,
             events,
@@ -228,7 +234,7 @@ impl eframe::App for MouseAnalyzerGui {
                 self.stop_flag.store(true, Ordering::SeqCst);
                 self.captured_events = self.events.lock().unwrap().clone();
                 self.is_capturing = false;
-                
+
                 // Clear Advanced LOD cache since we have new data
                 self.advanced_lod_segments.clear();
                 self.advanced_lod_last_events_len = 0;
@@ -239,12 +245,12 @@ impl eframe::App for MouseAnalyzerGui {
                 // Clear previous data
                 self.events.lock().unwrap().clear();
                 self.captured_events.clear();
-                
+
                 // Clear Advanced LOD cache
                 self.advanced_lod_segments.clear();
                 self.advanced_lod_last_events_len = 0;
                 self.advanced_lod_last_bounds = None;
-                
+
                 // Reset stop flag and restart capture
                 self.stop_flag.store(false, Ordering::SeqCst);
                 self.is_capturing = true;
@@ -408,7 +414,7 @@ impl eframe::App for MouseAnalyzerGui {
                                 };
 
                                 // Apply Advanced LOD
-                                let lod_indices = self.apply_advanced_lod_indices(&display_events, available_width as f64,available_height as f64, Some(&current_bounds));
+                                let lod_indices = self.apply_advanced_lod_indices(&display_events, available_width as f64, available_height as f64, Some(&current_bounds));
 
                                 // Helper to safely map indices to plot points
                                 let map_to_points = |indices: &[usize], map_fn: fn(&MouseMoveEvent) -> [f64; 2]| indices.iter().filter_map(|&idx| if idx < display_events.len() { Some(map_fn(&display_events[idx])) } else { None }).collect::<PlotPoints>();
