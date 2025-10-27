@@ -472,7 +472,7 @@ impl eframe::App for MouseAnalyzerGui {
                             ui.heading("Movement Plot (dx and -dy vs time)");
                             ui.separator();
 
-                            use egui_plot::{Line, Plot, PlotPoints};
+                            use egui_plot::{Line, Plot, PlotPoints, Points};
 
                             // Get screen resolution for LOD calculation
                             let available_width = ui.available_width();
@@ -505,6 +505,25 @@ impl eframe::App for MouseAnalyzerGui {
                                 plot_ui.line(dx_line);
                                 plot_ui.line(ndy_line);
 
+                                // Add error points visualization (shown as orange markers)
+                                if !self.advanced_lod_error_points.is_empty() {
+                                    // For dx error points
+                                    let dx_error_points = map_to_points(&self.advanced_lod_error_points, |e| [e.time_secs(), e.dx as f64]);
+                                    let dx_error_markers = Points::new(dx_error_points)
+                                        .color(egui::Color32::from_rgb(255, 165, 0))
+                                        .radius(3.0)
+                                        .name("dx errors");
+                                    plot_ui.points(dx_error_markers);
+
+                                    // For -dy error points
+                                    let ndy_error_points = map_to_points(&self.advanced_lod_error_points, |e| [e.time_secs(), -(e.dy as f64)]);
+                                    let ndy_error_markers = Points::new(ndy_error_points)
+                                        .color(egui::Color32::from_rgb(255, 165, 0))
+                                        .radius(3.0)
+                                        .name("-dy errors");
+                                    plot_ui.points(ndy_error_markers);
+                                }
+
                                 (current_bounds, lod_indices)
                             });
 
@@ -519,6 +538,14 @@ impl eframe::App for MouseAnalyzerGui {
                                 ui.label(format!("Advanced LOD: Showing {} of {} points ({:.1}% reduction)", lod_indices.len(), display_events.len(), reduction));
                             } else {
                                 ui.label(format!("Showing all {} points (no LOD)", display_events.len()));
+                            }
+
+                            // Show error points info
+                            if !self.advanced_lod_error_points.is_empty() {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(255, 165, 0),
+                                    format!("⚠ {} error points detected (shown as orange markers)", self.advanced_lod_error_points.len())
+                                );
                             }
                         });
                         ui.add_space(10.0);
