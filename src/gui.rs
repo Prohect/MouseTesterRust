@@ -1,4 +1,4 @@
-use crate::MouseMoveEvent;
+use crate::mouse_event::MouseMoveEvent;
 use eframe::egui;
 use std::sync::{
     Arc, Mutex,
@@ -105,12 +105,12 @@ impl MouseAnalyzerGui {
             self.last_events_len = events.len();
         }
 
-        // Constants for tuning
+        // Constants for tuning - optimized based on real mouse capture analysis
         const MARGIN_PX: f64 = 8.0;
         const COLINEARITY_TOL: f64 = 0.6;
-
-        // Calculate target points (2 points per pixel)
-        let target_points = (visible_width * 2.0) as usize;
+        const MIN_POINTS_PER_PIXEL: f64 = 0.5; // Minimum for 8kHz+ high-density devices
+        const MAX_POINTS_PER_PIXEL: f64 = 3.0; // Maximum when zoomed in
+        const HIGH_DENSITY_THRESHOLD: f64 = 5.0; // Threshold for aggressive reduction
 
         // Binary search to find visible slice
         let (start_idx, end_idx) = if let Some(bounds) = plot_bounds {
@@ -122,8 +122,8 @@ impl MouseAnalyzerGui {
             let x_max_with_margin = bounds.x_max + margin_time;
 
             // Use partition_point for binary search
-            let start = events.partition_point(|e| e.time < x_min_with_margin);
-            let end = events.partition_point(|e| e.time <= x_max_with_margin);
+            let start = events.partition_point(|e| e.time_secs() < x_min_with_margin);
+            let end = events.partition_point(|e| e.time_secs() <= x_max_with_margin);
 
             (start, end)
         } else {
@@ -135,6 +135,35 @@ impl MouseAnalyzerGui {
         if visible_count == 0 {
             return Vec::new();
         }
+
+        // Calculate target points based on data density and visible width
+        // When many events are visible (zoomed out), reduce points per pixel
+        // When few events are visible (zoomed in), use more points per pixel
+        // Optimized for 1kHz-8kHz mouse report rates based on real capture analysis
+        let data_density = visible_count as f64 / visible_width;
+
+        // Adaptive points per pixel based on data density
+        // Very high density (8kHz+, >5.0 events/pixel) -> 0.5 points/pixel
+        // High density (zoomed out, >3.0) -> 1.0 points/pixel
+        // Low density (zoomed in, <1.0) -> use all points
+        let points_per_pixel = if data_density > HIGH_DENSITY_THRESHOLD {
+            // Very high density (e.g., 8kHz sensor fully zoomed out): aggressive reduction
+            MIN_POINTS_PER_PIXEL
+        } else if data_density > MAX_POINTS_PER_PIXEL {
+            // High density: use 1.0 points per pixel
+            1.0
+        } else if data_density < 1.0 {
+            // Very low density: use all points (no downsampling)
+            data_density
+        } else {
+            // Medium density: scale between 1.0 and 3.0 points per pixel
+            // As density increases from 1.0 to 3.0, reduce from 3.0 to 1.0 points/pixel
+            let density_factor = (MAX_POINTS_PER_PIXEL - data_density) / (MAX_POINTS_PER_PIXEL - 1.0);
+            1.0 + density_factor * (MAX_POINTS_PER_PIXEL - 1.0)
+        };
+
+        let target_points = (visible_width * points_per_pixel).max(visible_width * MIN_POINTS_PER_PIXEL) as usize;
+        let target_points = target_points.min(visible_count); // Never exceed visible count
 
         if visible_count <= target_points {
             // No downsampling needed
@@ -198,7 +227,7 @@ impl MouseAnalyzerGui {
 
             // Add unique indices using time deduplication
             for &idx in &[first_idx, last_idx, min_dx_idx, max_dx_idx, min_dy_idx, max_dy_idx] {
-                let time_bits = events[idx].time.to_bits();
+                let time_bits = events[idx].time_secs().to_bits();
                 if dedup_set.insert(time_bits) {
                     selected_indices.push(idx);
                 }
@@ -224,8 +253,8 @@ impl MouseAnalyzerGui {
         }
 
         let count = events.len();
-        let time_start = events.iter().map(|e| e.time).fold(f64::INFINITY, |a, b| a.min(b));
-        let time_end = events.iter().map(|e| e.time).fold(f64::NEG_INFINITY, |a, b| a.max(b));
+        let time_start = events.iter().map(|e| e.time_secs()).fold(f64::INFINITY, |a, b| a.min(b));
+        let time_end = events.iter().map(|e| e.time_secs()).fold(f64::NEG_INFINITY, |a, b| a.max(b));
         let duration = (time_end - time_start).max(0.0);
 
         let total_dx: i64 = events.iter().map(|e| e.dx as i64).sum();
@@ -502,10 +531,10 @@ impl eframe::App for MouseAnalyzerGui {
                                 let map_to_points = |indices: &[usize], map_fn: fn(&MouseMoveEvent) -> [f64; 2]| indices.iter().filter_map(|&idx| if idx < display_events.len() { Some(map_fn(&display_events[idx])) } else { None }).collect::<PlotPoints>();
 
                                 // Build plot lines by mapping indices to events
-                                let dx_points = map_to_points(&lod_indices, |e| [e.time, e.dx as f64]);
+                                let dx_points = map_to_points(&lod_indices, |e| [e.time_secs(), e.dx as f64]);
                                 let dx_line = Line::new(dx_points).color(egui::Color32::from_rgb(255, 0, 0)).name("dx");
 
-                                let ndy_points = map_to_points(&lod_indices, |e| [e.time, -(e.dy as f64)]);
+                                let ndy_points = map_to_points(&lod_indices, |e| [e.time_secs(), -(e.dy as f64)]);
                                 let ndy_line = Line::new(ndy_points).color(egui::Color32::from_rgb(0, 0, 255)).name("-dy");
 
                                 plot_ui.line(dx_line);
@@ -523,7 +552,11 @@ impl eframe::App for MouseAnalyzerGui {
 
                             // Show LOD info if downsampling occurred
                             if lod_indices.len() < display_events.len() {
-                                ui.label(format!("Showing {} of {} points (LOD applied)", lod_indices.len(), display_events.len()));
+                                // Calculate reduction percentage
+                                let reduction = 100.0 * (1.0 - lod_indices.len() as f64 / display_events.len() as f64);
+                                ui.label(format!("LOD: Showing {} of {} points ({:.1}% reduction)", lod_indices.len(), display_events.len(), reduction));
+                            } else {
+                                ui.label(format!("Showing all {} points (no LOD)", display_events.len()));
                             }
                         });
                         ui.add_space(10.0);
@@ -572,7 +605,7 @@ impl eframe::App for MouseAnalyzerGui {
                                         ui.label(format!("{}", idx));
                                         ui.label(format!("{}", event.dx));
                                         ui.label(format!("{}", event.dy));
-                                        ui.label(format!("{:.6}", event.time));
+                                        ui.label(format!("{:.6}", event.time_secs()));
                                         ui.end_row();
                                     }
                                 });

@@ -7,9 +7,30 @@ A Rust-based tool for capturing and analyzing USB mouse events on Windows using 
 - Capture USB mouse movement data in real-time
 - Analyze mouse movement patterns and statistics
 - **NEW: Interactive GUI for easy visualization and analysis**
+- **NEW: Offline LOD (Level-of-Detail) module for efficient static plotting**
+- **NEW: Refactored MouseMoveEvent with precise pcap timestamps**
 - Export data to CSV format
 - Generate plots of mouse movement over time
 - Display movement magnitude histograms
+
+## Recent Changes
+
+### MouseMoveEvent Refactoring
+
+The `MouseMoveEvent` struct has been refactored to use pcap timestamp fields (`ts_sec` and `ts_usec`) instead of a single f64 time field. This provides:
+- More precise timestamp handling
+- Direct compatibility with pcap data structures
+- Helper methods for time conversion
+
+### Offline LOD Module
+
+A new hierarchical segmentation module has been added for efficient offline visualization:
+- Build segment trees from captured events
+- Adaptive rendering based on zoom/tolerance
+- Cubic polynomial fits with SVD for numerical stability
+- Cache-friendly design for performance
+
+See [LOD Module Documentation](docs/LOD_MODULE.md) for detailed usage and integration guide.
 
 ## Requirements
 
@@ -113,12 +134,26 @@ cargo check
 
 ## Dependencies
 
+- `nalgebra` - Linear algebra for LOD polynomial fits
 - `eframe` / `egui` - Modern GUI framework
 - `egui_plot` - Interactive plotting for GUI
 - `plotters` - Static plot generation for PNG output
 - `pcap` / `pcap-parser` - USB packet capture parsing
 - `anyhow` - Error handling
 - `byteorder` - Binary data parsing
+
+## Examples
+
+Run the LOD module demonstration:
+
+```bash
+cargo run --example lod_demo
+```
+
+This example shows:
+- Building hierarchical segment trees
+- Collecting view data at different tolerances
+- Performance metrics and data reduction
 
 ## Platform Notes
 
