@@ -260,3 +260,101 @@ fn test_lod_segment_quality_metrics() {
     
     println!("Successfully segmented mouse data");
 }
+
+#[test]
+fn test_lod_visibility_filtering() {
+    let path = Path::new("examples/test/output-20kSensor_1kReport.csv");
+    if !path.exists() {
+        println!("Skipping test - file not found: {:?}", path);
+        return;
+    }
+
+    let events = load_csv_events(path).expect("Failed to load CSV");
+    println!("Loaded {} events from 1kHz sensor data", events.len());
+
+    // Build segments
+    let segments = build_segments(&events, 15, 2.0, 0.7, 0.25);
+
+    // Get full time range
+    let full_x_min = events.first().map(|e| e.time_secs()).unwrap_or(0.0);
+    let full_x_max = events.last().map(|e| e.time_secs()).unwrap_or(1.0);
+    let y_min = events.iter().map(|e| -(e.dy as f64)).fold(f64::INFINITY, f64::min);
+    let y_max = events.iter().map(|e| -(e.dy as f64)).fold(f64::NEG_INFINITY, f64::max);
+
+    // Test 1: View range that's completely outside the data range (way before)
+    let out_of_range_before = collect_visible_indices(
+        &segments,
+        &events,
+        1920.0,
+        1080.0,
+        (full_x_min - 100.0, full_x_min - 50.0), // Range before any data
+        (y_min, y_max),
+        3.0,
+        1.5,
+    );
+
+    println!("Out of range (before) view: {} events", out_of_range_before.len());
+    assert_eq!(
+        out_of_range_before.len(),
+        0,
+        "Should return no events when view is completely before data range"
+    );
+
+    // Test 2: View range that's completely outside the data range (way after)
+    let out_of_range_after = collect_visible_indices(
+        &segments,
+        &events,
+        1920.0,
+        1080.0,
+        (full_x_max + 50.0, full_x_max + 100.0), // Range after any data
+        (y_min, y_max),
+        3.0,
+        1.5,
+    );
+
+    println!("Out of range (after) view: {} events", out_of_range_after.len());
+    assert_eq!(
+        out_of_range_after.len(),
+        0,
+        "Should return no events when view is completely after data range"
+    );
+
+    // Test 3: View range that contains some data
+    let time_range = full_x_max - full_x_min;
+    let mid_x = full_x_min + time_range * 0.5;
+    let partial_range = collect_visible_indices(
+        &segments,
+        &events,
+        1920.0,
+        1080.0,
+        (mid_x - time_range * 0.1, mid_x + time_range * 0.1), // Small window in middle
+        (y_min, y_max),
+        3.0,
+        1.5,
+    );
+
+    println!("Partial range view: {} events", partial_range.len());
+    assert!(
+        partial_range.len() > 0,
+        "Should return some events when view intersects data"
+    );
+    assert!(
+        partial_range.len() < events.len(),
+        "Should return fewer events than total when zoomed to partial range"
+    );
+
+    // Verify all returned event indices are actually within the requested time range
+    let tolerance = 1e-6; // Small tolerance for floating point comparison
+    for &idx in &partial_range {
+        let event = &events[idx];
+        let event_time = event.time_secs();
+        assert!(
+            event_time >= (mid_x - time_range * 0.1 - tolerance) && 
+            event_time <= (mid_x + time_range * 0.1 + tolerance),
+            "Event at index {} with time {} should be within view range [{}, {}]",
+            idx, event_time, mid_x - time_range * 0.1, mid_x + time_range * 0.1
+        );
+    }
+
+    println!("Visibility filtering working correctly!");
+}

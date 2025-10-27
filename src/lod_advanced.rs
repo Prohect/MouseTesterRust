@@ -365,12 +365,18 @@ pub fn collect_visible_indices(
         (px, py)
     };
 
+    // Helper: check if event is within visible time range
+    let is_visible = |event: &MouseMoveEvent| -> bool {
+        let time = event.time_secs();
+        time >= x_range.0 && time <= x_range.1
+    };
+
     // Process each segment
     for segment in segments {
         match segment {
             Segment::Discrete { idx } => {
-                // Always include discrete events
-                if *idx < events.len() {
+                // Only include discrete events if they're visible
+                if *idx < events.len() && is_visible(&events[*idx]) {
                     visible_indices.push(*idx);
                 }
             }
@@ -382,9 +388,18 @@ pub fn collect_visible_indices(
 
                 let segment_events = &events[*start_idx..*end_idx];
 
-                // Always include first and last to preserve continuity
-                visible_indices.push(*start_idx);
-                if end_idx - start_idx > 1 {
+                // Check if any event in this segment is visible
+                let has_visible = segment_events.iter().any(|e| is_visible(e));
+                if !has_visible {
+                    // Skip entire segment if no events are visible
+                    continue;
+                }
+
+                // Always include first and last to preserve continuity (if visible)
+                if is_visible(&events[*start_idx]) {
+                    visible_indices.push(*start_idx);
+                }
+                if end_idx - start_idx > 1 && is_visible(&events[*end_idx - 1]) {
                     visible_indices.push(*end_idx - 1);
                 }
 
@@ -392,6 +407,10 @@ pub fn collect_visible_indices(
                 let mut pixel_counts: std::collections::HashMap<(i32, i32), Vec<usize>> = std::collections::HashMap::new();
 
                 for (local_idx, event) in segment_events.iter().enumerate() {
+                    // Only process visible events
+                    if !is_visible(event) {
+                        continue;
+                    }
                     let global_idx = start_idx + local_idx;
                     let pixel = to_pixel(event);
                     pixel_counts.entry(pixel).or_insert_with(Vec::new).push(global_idx);
