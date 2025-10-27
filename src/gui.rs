@@ -122,7 +122,7 @@ impl MouseAnalyzerGui {
 
         // Collect visible indices with advanced LOD
         // - tolerance: 3.0 (allow up to 3 events per pixel before hiding)
-        // - zoom_factor: 1.5 (for future caching optimization)
+        // - zoom_factor: 1.2 
         let indices = collect_visible_indices(
             &self.advanced_lod_segments,
             events,
@@ -131,7 +131,7 @@ impl MouseAnalyzerGui {
             (x_min, x_max),
             (y_min, y_max),
             3.0, // tolerance
-            1.5, // zoom_factor
+            1.2, // zoom_factor
         );
 
         indices

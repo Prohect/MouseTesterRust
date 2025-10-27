@@ -355,8 +355,12 @@ pub fn collect_visible_indices(
     let mut seen_pixels = HashSet::new();
 
     // Calculate pixel scales
-    let x_scale = render_width / (x_range.1 - x_range.0).max(1e-10);
-    let y_scale = render_height / (y_range.1 - y_range.0).max(1e-10);
+    let x_range_size = x_range.1 - x_range.0;
+    let y_range_size = y_range.1 - y_range.0;
+    let x_scale = render_width / (x_range_size).max(1e-10);
+    let y_scale = render_height / (y_range_size).max(1e-10);
+    let min_x_visible = x_range.0 - (x_range_size * ((_zoom_factor-1.0)/2.0)) ;
+    let max_x_visible = x_range.1 + (x_range_size * ((_zoom_factor-1.0)/2.0)) ;
 
     // Helper: convert event to pixel coordinates
     let to_pixel = |event: &MouseMoveEvent| -> (i32, i32) {
@@ -368,7 +372,7 @@ pub fn collect_visible_indices(
     // Helper: check if event is within visible time range
     let is_visible = |event: &MouseMoveEvent| -> bool {
         let time = event.time_secs();
-        time >= x_range.0 && time <= x_range.1
+        time >= min_x_visible && time <= max_x_visible
     };
 
     // Process each segment
