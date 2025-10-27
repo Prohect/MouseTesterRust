@@ -692,7 +692,7 @@ mod tests {
         
         // Should detect some error points due to outliers
         println!("Detected {} error points with outliers", error_points.len());
-        assert!(error_points.len() > 0, "Should detect error points with outliers");
+        assert!(!error_points.is_empty(), "Should detect error points with outliers");
     }
 
     #[test]
