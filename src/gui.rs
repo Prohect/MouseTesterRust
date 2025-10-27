@@ -90,7 +90,7 @@ impl MouseAnalyzerGui {
 
     /// NEW ADVANCED LOD: Apply the advanced LOD algorithm with regression-based segmentation
     /// Returns indices into the events slice for rendering
-    fn apply_advanced_lod_indices(&mut self, events: &[MouseMoveEvent], visible_width: f64, plot_bounds: Option<&PlotBounds>) -> Vec<usize> {
+    fn apply_advanced_lod_indices(&mut self, events: &[MouseMoveEvent], visible_width: f64,visible_height: f64, plot_bounds: Option<&PlotBounds>) -> Vec<usize> {
         if events.is_empty() {
             return Vec::new();
         }
@@ -102,8 +102,8 @@ impl MouseAnalyzerGui {
             // - initial_size: 15 (start with 15-event segments)
             // - growth_factor: 2.0 (double size when expanding)
             // - min_r_squared: 0.7 (require decent fit quality)
-            // - balance_weight: 0.6 (slightly favor length over R-squared)
-            self.advanced_lod_segments = build_segments(events, 15, 2.0, 0.7, 0.6);
+            // - balance_weight: 0.25 (ln(len) is not and cant be normalized to 0.0 ~ 1.0)
+            self.advanced_lod_segments = build_segments(events, 15, 2.0, 0.7, 0.25);
             self.advanced_lod_last_events_len = events.len();
             println!("Created {} segments", self.advanced_lod_segments.len());
         }
@@ -123,7 +123,6 @@ impl MouseAnalyzerGui {
         // Collect visible indices with advanced LOD
         // - tolerance: 3.0 (allow up to 3 events per pixel before hiding)
         // - zoom_factor: 1.5 (for future caching optimization)
-        let visible_height = visible_width / 2.0; // Approximate aspect ratio
         let indices = collect_visible_indices(
             &self.advanced_lod_segments,
             events,
@@ -393,8 +392,9 @@ impl eframe::App for MouseAnalyzerGui {
 
                             use egui_plot::{Line, Plot, PlotPoints};
 
-                            // Get screen width for LOD calculation
+                            // Get screen resolution for LOD calculation
                             let available_width = ui.available_width();
+                            let available_height = ui.available_height();
 
                             // Show the plot and capture its response to get bounds
                             let plot_response = Plot::new("mouse_plot").view_aspect(2.0).legend(egui_plot::Legend::default()).show(ui, |plot_ui| {
@@ -408,7 +408,7 @@ impl eframe::App for MouseAnalyzerGui {
                                 };
 
                                 // Apply Advanced LOD
-                                let lod_indices = self.apply_advanced_lod_indices(&display_events, available_width as f64, Some(&current_bounds));
+                                let lod_indices = self.apply_advanced_lod_indices(&display_events, available_width as f64,available_height as f64, Some(&current_bounds));
 
                                 // Helper to safely map indices to plot points
                                 let map_to_points = |indices: &[usize], map_fn: fn(&MouseMoveEvent) -> [f64; 2]| indices.iter().filter_map(|&idx| if idx < display_events.len() { Some(map_fn(&display_events[idx])) } else { None }).collect::<PlotPoints>();

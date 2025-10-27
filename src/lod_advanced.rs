@@ -66,12 +66,7 @@ impl Poly3 {
 
     /// Create a zero polynomial
     pub fn zero() -> Self {
-        Self {
-            a0: 0.0,
-            a1: 0.0,
-            a2: 0.0,
-            a3: 0.0,
-        }
+        Self { a0: 0.0, a1: 0.0, a2: 0.0, a3: 0.0 }
     }
 }
 
@@ -92,11 +87,7 @@ pub struct SegmentFit {
 #[derive(Debug, Clone)]
 pub enum Segment {
     /// Good segment with high-quality polynomial fit
-    Good {
-        start_idx: usize,
-        end_idx: usize,
-        fit: SegmentFit,
-    },
+    Good { start_idx: usize, end_idx: usize, fit: SegmentFit },
     /// Discrete event that doesn't fit well
     Discrete { idx: usize },
 }
@@ -183,11 +174,7 @@ fn calculate_r_squared(y_actual: &[f64], y_pred: &[f64]) -> f64 {
     let y_mean = y_actual.iter().sum::<f64>() / n;
 
     let ss_tot: f64 = y_actual.iter().map(|&y| (y - y_mean).powi(2)).sum();
-    let ss_res: f64 = y_actual
-        .iter()
-        .zip(y_pred.iter())
-        .map(|(&y_a, &y_p)| (y_a - y_p).powi(2))
-        .sum();
+    let ss_res: f64 = y_actual.iter().zip(y_pred.iter()).map(|(&y_a, &y_p)| (y_a - y_p).powi(2)).sum();
 
     if ss_tot < 1e-10 {
         // If variance is near zero, perfect fit
@@ -209,9 +196,7 @@ fn analyze_segment(events: &[MouseMoveEvent], start_idx: usize, end_idx: usize) 
     let (idx_norm, _, _) = normalize_to_unit(&indices);
 
     // Extract time values
-    let times: Vec<f64> = (start_idx..end_idx)
-        .map(|i| events[i].time_secs())
-        .collect();
+    let times: Vec<f64> = (start_idx..end_idx).map(|i| events[i].time_secs()).collect();
 
     // Extract dx and dy values
     let dx_vals: Vec<f64> = (start_idx..end_idx).map(|i| events[i].dx as f64).collect();
@@ -262,13 +247,7 @@ fn is_discrete_event(event: &MouseMoveEvent) -> bool {
 /// # Returns
 ///
 /// Vector of segments (Good or Discrete)
-pub fn build_segments(
-    events: &[MouseMoveEvent],
-    initial_size: usize,
-    growth_factor: f64,
-    min_r_squared: f64,
-    balance_weight: f64,
-) -> Vec<Segment> {
+pub fn build_segments(events: &[MouseMoveEvent], initial_size: usize, growth_factor: f64, min_r_squared: f64, balance_weight: f64) -> Vec<Segment> {
     if events.is_empty() {
         return Vec::new();
     }
@@ -288,36 +267,37 @@ pub fn build_segments(
         let mut best_fit: Option<SegmentFit> = None;
         let mut best_score = f64::NEG_INFINITY;
         let mut current_size = initial_size;
+        let mut fit_tolerance = 0;
+        let max_fit_tolerance = 8;
 
         while pos + current_size <= events.len() {
             let end = pos + current_size;
 
             if let Some(fit) = analyze_segment(events, pos, end) {
                 // Calculate composite R-squared (average of dx, dy, time)
-                let avg_r_squared =
-                    (fit.dx_r_squared + fit.dy_r_squared + fit.time_r_squared) / 3.0;
+                let avg_r_squared = (fit.dx_r_squared + fit.dy_r_squared + fit.time_r_squared) / 3.0;
 
                 // Only consider if all individual R-squared values are reasonable
-                if avg_r_squared >= min_r_squared
-                    && fit.time_r_squared >= min_r_squared * 0.8
-                {
+                if avg_r_squared >= min_r_squared && fit.time_r_squared >= min_r_squared * 0.8 {
                     // Score balances R-squared and segment length
                     // Higher balance_weight favors longer segments
                     let length_score = (current_size as f64).ln();
-                    let score =
-                        balance_weight * length_score + (1.0 - balance_weight) * avg_r_squared;
+                    let score = balance_weight * length_score + (1.0 - balance_weight) * avg_r_squared;
 
                     if score > best_score {
                         best_score = score;
                         best_fit = Some(fit);
+                        fit_tolerance = 0;
                     }
-
-                    // Try larger segment
-                    current_size = ((current_size as f64) * growth_factor).ceil() as usize;
                 } else {
-                    // Fit quality degraded, stop growing
-                    break;
+                    // Fit quality degraded
+                    fit_tolerance += 1;
+                    if fit_tolerance > max_fit_tolerance {
+                        break;
+                    }
                 }
+                // Try larger segment
+                current_size = ((current_size as f64) * growth_factor).ceil() as usize;
             } else {
                 break;
             }
@@ -394,11 +374,7 @@ pub fn collect_visible_indices(
                     visible_indices.push(*idx);
                 }
             }
-            Segment::Good {
-                start_idx,
-                end_idx,
-                ..
-            } => {
+            Segment::Good { start_idx, end_idx, .. } => {
                 // For good segments, apply intelligent filtering
                 if *start_idx >= events.len() || *end_idx > events.len() {
                     continue;
@@ -413,8 +389,7 @@ pub fn collect_visible_indices(
                 }
 
                 // For interior points, apply tolerance-based filtering
-                let mut pixel_counts: std::collections::HashMap<(i32, i32), Vec<usize>> =
-                    std::collections::HashMap::new();
+                let mut pixel_counts: std::collections::HashMap<(i32, i32), Vec<usize>> = std::collections::HashMap::new();
 
                 for (local_idx, event) in segment_events.iter().enumerate() {
                     let global_idx = start_idx + local_idx;
@@ -483,11 +458,7 @@ mod tests {
             let t_sec = i as u32;
             let t_usec = 0;
             // Every 5th event is zero
-            let (dx, dy) = if i % 5 == 0 {
-                (0, 0)
-            } else {
-                ((i * 10) as i16, -(i as i16 * 5))
-            };
+            let (dx, dy) = if i % 5 == 0 { (0, 0) } else { ((i * 10) as i16, -(i as i16 * 5)) };
             events.push(MouseMoveEvent::new(dx, dy, t_sec, t_usec));
         }
         events
@@ -495,12 +466,7 @@ mod tests {
 
     #[test]
     fn test_poly3_eval() {
-        let poly = Poly3 {
-            a0: 1.0,
-            a1: 2.0,
-            a2: 3.0,
-            a3: 4.0,
-        };
+        let poly = Poly3 { a0: 1.0, a1: 2.0, a2: 3.0, a3: 4.0 };
         assert_eq!(poly.eval(0.0), 1.0);
         assert_eq!(poly.eval(1.0), 10.0);
     }
@@ -519,7 +485,7 @@ mod tests {
         let x = vec![0.0, 0.25, 0.5, 0.75, 1.0];
         let y: Vec<f64> = x.iter().map(|&t| t * t * t).collect();
         let poly = fit_cubic(&x, &y).unwrap();
-        
+
         // Should approximate cubic function
         assert!((poly.a0).abs() < 0.1);
         assert!((poly.a3 - 1.0).abs() < 0.1);
@@ -537,7 +503,7 @@ mod tests {
     fn test_is_discrete_event() {
         let zero_event = MouseMoveEvent::new(0, 0, 0, 0);
         let normal_event = MouseMoveEvent::new(10, -5, 0, 0);
-        
+
         assert!(is_discrete_event(&zero_event));
         assert!(!is_discrete_event(&normal_event));
     }
@@ -546,7 +512,7 @@ mod tests {
     fn test_analyze_segment() {
         let events = make_test_events(10);
         let fit = analyze_segment(&events, 0, 10);
-        
+
         assert!(fit.is_some());
         let fit = fit.unwrap();
         assert_eq!(fit.start_idx, 0);
@@ -561,7 +527,7 @@ mod tests {
     fn test_build_segments_simple() {
         let events = make_test_events(20);
         let segments = build_segments(&events, 5, 2.0, 0.8, 0.5);
-        
+
         assert!(!segments.is_empty());
         // Should have at least one good segment
         let has_good = segments.iter().any(|s| matches!(s, Segment::Good { .. }));
@@ -572,7 +538,7 @@ mod tests {
     fn test_build_segments_with_discrete() {
         let events = make_test_events_with_zeros(20);
         let segments = build_segments(&events, 5, 2.0, 0.8, 0.5);
-        
+
         assert!(!segments.is_empty());
         // Should have some discrete events
         let discrete_count = segments.iter().filter(|s| matches!(s, Segment::Discrete { .. })).count();
@@ -583,20 +549,11 @@ mod tests {
     fn test_collect_visible_indices() {
         let events = make_test_events(100);
         let segments = build_segments(&events, 10, 1.5, 0.85, 0.5);
-        
+
         let x_range = (0.0, 100.0);
         let y_range = (-500.0, 1000.0);
-        let indices = collect_visible_indices(
-            &segments,
-            &events,
-            800.0,
-            600.0,
-            x_range,
-            y_range,
-            5.0,
-            1.5,
-        );
-        
+        let indices = collect_visible_indices(&segments, &events, 800.0, 600.0, x_range, y_range, 5.0, 1.5);
+
         assert!(!indices.is_empty());
         assert!(indices.len() <= events.len());
         // Should maintain sorted order
@@ -613,10 +570,10 @@ mod tests {
             last_x_range: (0.0, 100.0),
             last_y_range: (0.0, 100.0),
         };
-        
+
         // Should reuse when zoomed in
         assert!(cache.can_reuse((10.0, 50.0), (10.0, 50.0), 1.5));
-        
+
         // Should not reuse when zoomed out
         assert!(!cache.can_reuse((0.0, 200.0), (0.0, 200.0), 1.0));
     }
