@@ -17,6 +17,7 @@ use std::{
 
 mod gui;
 pub mod lod;
+pub mod lod_advanced;
 pub mod mouse_event;
 
 use mouse_event::{MouseMoveEvent, PcapRecordHeader};

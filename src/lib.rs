@@ -5,6 +5,7 @@
 //!
 //! - `mouse_event`: Data structures and parsers for mouse movement events with pcap timestamps
 //! - `lod`: Level-of-detail hierarchical segmentation for efficient offline data visualization
+//! - `lod_advanced`: Advanced LOD with time consistency analysis and adaptive segmentation
 //!
 //! # Example
 //!
@@ -24,4 +25,5 @@
 //! ```
 
 pub mod lod;
+pub mod lod_advanced;
 pub mod mouse_event;

@@ -1,4 +1,6 @@
 use crate::mouse_event::MouseMoveEvent;
+// Import the new advanced LOD module
+use crate::lod_advanced::{build_segments, collect_visible_indices, Segment};
 use eframe::egui;
 use std::sync::{
     Arc, Mutex,
@@ -20,13 +22,18 @@ pub struct MouseAnalyzerGui {
     captured_events: Vec<MouseMoveEvent>,       // Events snapshot when capture stopped
     last_f2_state: bool,                        // For edge detection
     target_device: Option<crate::TargetDevice>, // Store target device for restarts
-    // LOD state for intelligent updates (indices-based)
-    cached_lod_indices: Vec<usize>,
-    lod_pyramid: Vec<Vec<usize>>, // Lazy LOD pyramid for fast lookups
-    last_plot_bounds: Option<PlotBounds>,
-    last_target_points: Option<usize>, // Track target_points for coarsen-from-previous
-    last_events_len: usize,            // For cache invalidation on capture reset
-    lod_threshold: f64,                // Threshold for triggering LOD recalculation (0.1 = 10% change)
+    // OLD LOD state for intelligent updates (indices-based) - COMMENTED OUT
+    // cached_lod_indices: Vec<usize>,
+    // lod_pyramid: Vec<Vec<usize>>, // Lazy LOD pyramid for fast lookups
+    // last_plot_bounds: Option<PlotBounds>,
+    // last_target_points: Option<usize>, // Track target_points for coarsen-from-previous
+    // last_events_len: usize,            // For cache invalidation on capture reset
+    // lod_threshold: f64,                // Threshold for triggering LOD recalculation (0.1 = 10% change)
+    
+    // NEW ADVANCED LOD state
+    advanced_lod_segments: Vec<Segment>,
+    advanced_lod_last_events_len: usize,
+    advanced_lod_last_bounds: Option<PlotBounds>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -50,18 +57,24 @@ impl MouseAnalyzerGui {
             captured_events: Vec::new(),
             last_f2_state: false,
             target_device,
-            cached_lod_indices: Vec::new(),
-            lod_pyramid: Vec::new(),
-            last_plot_bounds: None,
-            last_target_points: None,
-            last_events_len: 0,
-            lod_threshold: 0.1, // 10% change threshold
+            // OLD LOD - commented out
+            // cached_lod_indices: Vec::new(),
+            // lod_pyramid: Vec::new(),
+            // last_plot_bounds: None,
+            // last_target_points: None,
+            // last_events_len: 0,
+            // lod_threshold: 0.1, // 10% change threshold
+            
+            // NEW ADVANCED LOD initialization
+            advanced_lod_segments: Vec::new(),
+            advanced_lod_last_events_len: 0,
+            advanced_lod_last_bounds: None,
         }
     }
 
     /// Check if plot bounds have changed significantly
     fn bounds_changed_significantly(&self, new_bounds: &PlotBounds) -> bool {
-        match self.last_plot_bounds {
+        match self.advanced_lod_last_bounds {
             None => true, // First time, always recalculate
             Some(old_bounds) => {
                 let x_range_old = (old_bounds.x_max - old_bounds.x_min).abs();
@@ -69,7 +82,7 @@ impl MouseAnalyzerGui {
                 let x_range_new = (new_bounds.x_max - new_bounds.x_min).abs();
                 let y_range_new = (new_bounds.y_max - new_bounds.y_min).abs();
 
-                // Check if range changed by more than threshold
+                // Check if range changed by more than threshold (10%)
                 let x_change = ((x_range_new - x_range_old) / x_range_old.max(1e-6)).abs();
                 let y_change = ((y_range_new - y_range_old) / y_range_old.max(1e-6)).abs();
 
@@ -82,14 +95,68 @@ impl MouseAnalyzerGui {
                 let x_center_change = ((x_center_new - x_center_old) / x_range_old.max(1e-6)).abs();
                 let y_center_change = ((y_center_new - y_center_old) / y_range_old.max(1e-6)).abs();
 
-                // Trigger if any change exceeds threshold
-                x_change > self.lod_threshold || y_change > self.lod_threshold || x_center_change > self.lod_threshold || y_center_change > self.lod_threshold
+                // Trigger if any change exceeds 10% threshold
+                let threshold = 0.1;
+                x_change > threshold || y_change > threshold || x_center_change > threshold || y_center_change > threshold
             }
         }
     }
 
-    /// Indices-based LOD pipeline for improved performance with static captures
-    /// Returns indices into the events slice instead of cloning events
+    /// NEW ADVANCED LOD: Apply the advanced LOD algorithm with regression-based segmentation
+    /// Returns indices into the events slice for rendering
+    fn apply_advanced_lod_indices(&mut self, events: &[MouseMoveEvent], visible_width: f64, plot_bounds: Option<&PlotBounds>) -> Vec<usize> {
+        if events.is_empty() {
+            return Vec::new();
+        }
+
+        // Check if we need to rebuild segments (events changed)
+        if events.len() != self.advanced_lod_last_events_len {
+            println!("Building advanced LOD segments for {} events...", events.len());
+            // Build segments with good parameters for real mouse data
+            // - initial_size: 15 (start with 15-event segments)
+            // - growth_factor: 2.0 (double size when expanding)
+            // - min_r_squared: 0.7 (require decent fit quality)
+            // - balance_weight: 0.6 (slightly favor length over R-squared)
+            self.advanced_lod_segments = build_segments(events, 15, 2.0, 0.7, 0.6);
+            self.advanced_lod_last_events_len = events.len();
+            println!("Created {} segments", self.advanced_lod_segments.len());
+        }
+
+        // Get bounds or use full range
+        let (x_min, x_max, y_min, y_max) = if let Some(bounds) = plot_bounds {
+            (bounds.x_min, bounds.x_max, bounds.y_min, bounds.y_max)
+        } else {
+            // Full range
+            let x_min = events.first().map(|e| e.time_secs()).unwrap_or(0.0);
+            let x_max = events.last().map(|e| e.time_secs()).unwrap_or(1.0);
+            let y_min = events.iter().map(|e| -(e.dy as f64)).fold(f64::INFINITY, f64::min);
+            let y_max = events.iter().map(|e| -(e.dy as f64)).fold(f64::NEG_INFINITY, f64::max);
+            (x_min, x_max, y_min, y_max)
+        };
+
+        // Collect visible indices with advanced LOD
+        // - tolerance: 3.0 (allow up to 3 events per pixel before hiding)
+        // - zoom_factor: 1.5 (for future caching optimization)
+        let visible_height = visible_width / 2.0; // Approximate aspect ratio
+        let indices = collect_visible_indices(
+            &self.advanced_lod_segments,
+            events,
+            visible_width,
+            visible_height,
+            (x_min, x_max),
+            (y_min, y_max),
+            3.0, // tolerance
+            1.5, // zoom_factor
+        );
+
+        indices
+    }
+
+    // OLD LOD FUNCTION - COMMENTED OUT (replaced with apply_advanced_lod_indices)
+    // This function used bucket-based sampling with min/max preservation
+    // The new advanced LOD uses cubic polynomial regression with R-squared analysis
+    
+    /*
     fn apply_lod_indices(&mut self, events: &[MouseMoveEvent], visible_width: f64, plot_bounds: Option<&PlotBounds>) -> Vec<usize> {
         use std::collections::HashSet;
 
@@ -246,6 +313,7 @@ impl MouseAnalyzerGui {
 
         selected_indices
     }
+    */
 
     fn calculate_stats(&self, events: &[MouseMoveEvent]) -> Stats {
         if events.is_empty() {
@@ -338,23 +406,35 @@ impl eframe::App for MouseAnalyzerGui {
                 self.stop_flag.store(true, Ordering::SeqCst);
                 self.captured_events = self.events.lock().unwrap().clone();
                 self.is_capturing = false;
-                // Clear LOD cache since we have new data
-                self.cached_lod_indices.clear();
-                self.lod_pyramid.clear();
-                self.last_plot_bounds = None;
-                self.last_target_points = None;
-                self.last_events_len = self.captured_events.len();
+                // Clear LOD cache since we have new data - OLD LOD (commented out)
+                // self.cached_lod_indices.clear();
+                // self.lod_pyramid.clear();
+                // self.last_plot_bounds = None;
+                // self.last_target_points = None;
+                // self.last_events_len = self.captured_events.len();
+                
+                // Clear NEW ADVANCED LOD cache
+                self.advanced_lod_segments.clear();
+                self.advanced_lod_last_events_len = 0;
+                self.advanced_lod_last_bounds = None;
             } else {
                 // Start a new capture
                 println!("F2 pressed: starting new capture...");
                 // Clear previous data
                 self.events.lock().unwrap().clear();
                 self.captured_events.clear();
-                self.cached_lod_indices.clear();
-                self.lod_pyramid.clear();
-                self.last_plot_bounds = None;
-                self.last_target_points = None;
-                self.last_events_len = 0;
+                // OLD LOD cache clear (commented out)
+                // self.cached_lod_indices.clear();
+                // self.lod_pyramid.clear();
+                // self.last_plot_bounds = None;
+                // self.last_target_points = None;
+                // self.last_events_len = 0;
+                
+                // Clear NEW ADVANCED LOD cache
+                self.advanced_lod_segments.clear();
+                self.advanced_lod_last_events_len = 0;
+                self.advanced_lod_last_bounds = None;
+                
                 // Reset stop flag and restart capture
                 self.stop_flag.store(false, Ordering::SeqCst);
                 self.is_capturing = true;
@@ -516,16 +596,19 @@ impl eframe::App for MouseAnalyzerGui {
                                     y_max: bounds.max()[1],
                                 };
 
+                                // OLD LOD CALL - COMMENTED OUT
                                 // Check if we need to recalculate LOD
-                                let needs_lod_update = self.bounds_changed_significantly(&current_bounds) || self.cached_lod_indices.is_empty();
+                                // let needs_lod_update = self.bounds_changed_significantly(&current_bounds) || self.cached_lod_indices.is_empty();
+                                // let lod_indices = if needs_lod_update {
+                                //     // Recalculate LOD with current bounds
+                                //     self.apply_lod_indices(&display_events, available_width as f64, Some(&current_bounds))
+                                // } else {
+                                //     // Use cached LOD indices
+                                //     self.cached_lod_indices.clone()
+                                // };
 
-                                let lod_indices = if needs_lod_update {
-                                    // Recalculate LOD with current bounds
-                                    self.apply_lod_indices(&display_events, available_width as f64, Some(&current_bounds))
-                                } else {
-                                    // Use cached LOD indices
-                                    self.cached_lod_indices.clone()
-                                };
+                                // NEW ADVANCED LOD CALL
+                                let lod_indices = self.apply_advanced_lod_indices(&display_events, available_width as f64, Some(&current_bounds));
 
                                 // Helper to safely map indices to plot points
                                 let map_to_points = |indices: &[usize], map_fn: fn(&MouseMoveEvent) -> [f64; 2]| indices.iter().filter_map(|&idx| if idx < display_events.len() { Some(map_fn(&display_events[idx])) } else { None }).collect::<PlotPoints>();
@@ -540,21 +623,18 @@ impl eframe::App for MouseAnalyzerGui {
                                 plot_ui.line(dx_line);
                                 plot_ui.line(ndy_line);
 
-                                (current_bounds, lod_indices, needs_lod_update)
+                                (current_bounds, lod_indices)
                             });
 
-                            // Update cached values if LOD was recalculated
-                            let (current_bounds, lod_indices, needs_lod_update) = plot_response.inner;
-                            if needs_lod_update {
-                                self.cached_lod_indices = lod_indices.clone();
-                                self.last_plot_bounds = Some(current_bounds);
-                            }
+                            // Update cached values
+                            let (current_bounds, lod_indices) = plot_response.inner;
+                            self.advanced_lod_last_bounds = Some(current_bounds);
 
                             // Show LOD info if downsampling occurred
                             if lod_indices.len() < display_events.len() {
                                 // Calculate reduction percentage
                                 let reduction = 100.0 * (1.0 - lod_indices.len() as f64 / display_events.len() as f64);
-                                ui.label(format!("LOD: Showing {} of {} points ({:.1}% reduction)", lod_indices.len(), display_events.len(), reduction));
+                                ui.label(format!("Advanced LOD: Showing {} of {} points ({:.1}% reduction)", lod_indices.len(), display_events.len(), reduction));
                             } else {
                                 ui.label(format!("Showing all {} points (no LOD)", display_events.len()));
                             }

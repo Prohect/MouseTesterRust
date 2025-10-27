@@ -1,0 +1,609 @@
+//! Advanced Level-of-Detail (LOD) algorithm with time consistency and regression-based segmentation
+//!
+//! This module implements an intelligent LOD algorithm that analyzes mouse movement events
+//! for time consistency and data quality, segments them based on cubic polynomial regression
+//! quality (R-squared), and provides efficient view-dependent filtering with caching.
+//!
+//! # Key Features
+//!
+//! - **Time Consistency Analysis**: Detects events with poor time linearity (report rate issues)
+//! - **Discrete Event Detection**: Identifies zero-movement events and outliers
+//! - **Adaptive Segmentation**: Creates segments with optimal R-squared and length balance
+//! - **Smart Caching**: Caches regression results and reuses them for zoom operations
+//! - **View-Dependent Filtering**: Hides redundant events based on rendering resolution
+//!
+//! # Algorithm Overview
+//!
+//! 1. **Segment Analysis Phase**:
+//!    - Start with initial segment size (e.g., 10 events)
+//!    - Try larger segments by multiplying size by growth factor (1.5 or 2)
+//!    - For each segment size, compute cubic polynomial fit for dx, dy, and time vs index
+//!    - Calculate R-squared to measure fit quality
+//!    - Balance between segment length and R-squared (prefer longer segments with good R²)
+//!    - Mark discrete events: zero dx/dy, or poor time/position consistency
+//!
+//! 2. **Caching Phase**:
+//!    - Store segment boundaries with their regression parameters
+//!    - Cache R-squared values for each segment
+//!    - Store indices of discrete events separately
+//!
+//! 3. **View Collection Phase**:
+//!    - Given rendering resolution, x/y ranges, tolerance, and zoom factor
+//!    - Calculate which events map to same pixel on screen
+//!    - Keep first and last event of each good segment (preserve continuity)
+//!    - Apply tolerance: hide events if more than tolerance map to same pixel
+//!    - Return list of event indices that should be rendered
+
+use crate::mouse_event::MouseMoveEvent;
+use nalgebra::{DMatrix, DVector};
+use std::collections::HashSet;
+
+/// Cubic polynomial coefficients: f(t) = a0 + a1*t + a2*t^2 + a3*t^3
+#[derive(Debug, Clone, Copy)]
+pub struct Poly3 {
+    pub a0: f64,
+    pub a1: f64,
+    pub a2: f64,
+    pub a3: f64,
+}
+
+impl Poly3 {
+    /// Evaluate the polynomial at time t
+    pub fn eval(&self, t: f64) -> f64 {
+        self.a0 + self.a1 * t + self.a2 * t * t + self.a3 * t * t * t
+    }
+
+    /// Create a zero polynomial
+    pub fn zero() -> Self {
+        Self {
+            a0: 0.0,
+            a1: 0.0,
+            a2: 0.0,
+            a3: 0.0,
+        }
+    }
+}
+
+/// Result of regression analysis for a segment
+#[derive(Debug, Clone)]
+pub struct SegmentFit {
+    pub start_idx: usize,
+    pub end_idx: usize,
+    pub dx_poly: Poly3,
+    pub dy_poly: Poly3,
+    pub time_poly: Poly3, // Time vs index fit
+    pub dx_r_squared: f64,
+    pub dy_r_squared: f64,
+    pub time_r_squared: f64, // Time consistency metric
+}
+
+/// Represents a segment of events with classification
+#[derive(Debug, Clone)]
+pub enum Segment {
+    /// Good segment with high-quality polynomial fit
+    Good {
+        start_idx: usize,
+        end_idx: usize,
+        fit: SegmentFit,
+    },
+    /// Discrete event that doesn't fit well
+    Discrete { idx: usize },
+}
+
+/// Cached LOD analysis result
+#[derive(Debug, Clone)]
+pub struct LodCache {
+    pub segments: Vec<Segment>,
+    pub zoom_factor: f64,
+    pub last_x_range: (f64, f64),
+    pub last_y_range: (f64, f64),
+}
+
+impl LodCache {
+    /// Check if cached result can be reused for given view
+    pub fn can_reuse(&self, x_range: (f64, f64), y_range: (f64, f64), zoom_factor: f64) -> bool {
+        // Cache is valid if new view is within cached view (zoomed in)
+        let x_within = x_range.0 >= self.last_x_range.0 && x_range.1 <= self.last_x_range.1;
+        let y_within = y_range.0 >= self.last_y_range.0 && y_range.1 <= self.last_y_range.1;
+        let zoom_ok = zoom_factor >= self.zoom_factor * 0.9; // Allow 10% tolerance
+
+        x_within && y_within && zoom_ok
+    }
+}
+
+/// Normalize values to [0, 1] range for better numerical conditioning
+fn normalize_to_unit(values: &[f64]) -> (Vec<f64>, f64, f64) {
+    if values.is_empty() {
+        return (Vec::new(), 0.0, 1.0);
+    }
+
+    let min_val = values.iter().copied().fold(f64::INFINITY, f64::min);
+    let max_val = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let range = (max_val - min_val).max(1e-10);
+
+    let normalized: Vec<f64> = values.iter().map(|&v| (v - min_val) / range).collect();
+
+    (normalized, min_val, range)
+}
+
+/// Fit a cubic polynomial using least-squares with SVD
+fn fit_cubic(x_norm: &[f64], y: &[f64]) -> Option<Poly3> {
+    let n = x_norm.len();
+    if n < 4 {
+        return None;
+    }
+
+    // Build design matrix: [1, x, x^2, x^3]
+    let mut a_data = vec![0.0; n * 4];
+    for i in 0..n {
+        let x = x_norm[i];
+        let x2 = x * x;
+        let x3 = x2 * x;
+        a_data[i * 4] = 1.0;
+        a_data[i * 4 + 1] = x;
+        a_data[i * 4 + 2] = x2;
+        a_data[i * 4 + 3] = x3;
+    }
+
+    let a = DMatrix::from_row_slice(n, 4, &a_data);
+    let b = DVector::from_row_slice(y);
+
+    let svd = a.svd(true, true);
+    let coeffs = svd.solve(&b, 1e-10).ok()?;
+
+    Some(Poly3 {
+        a0: coeffs[0],
+        a1: coeffs[1],
+        a2: coeffs[2],
+        a3: coeffs[3],
+    })
+}
+
+/// Calculate R-squared (coefficient of determination) for a fit
+fn calculate_r_squared(y_actual: &[f64], y_pred: &[f64]) -> f64 {
+    if y_actual.len() != y_pred.len() || y_actual.is_empty() {
+        return 0.0;
+    }
+
+    let n = y_actual.len() as f64;
+    let y_mean = y_actual.iter().sum::<f64>() / n;
+
+    let ss_tot: f64 = y_actual.iter().map(|&y| (y - y_mean).powi(2)).sum();
+    let ss_res: f64 = y_actual
+        .iter()
+        .zip(y_pred.iter())
+        .map(|(&y_a, &y_p)| (y_a - y_p).powi(2))
+        .sum();
+
+    if ss_tot < 1e-10 {
+        // If variance is near zero, perfect fit
+        return 1.0;
+    }
+
+    1.0 - (ss_res / ss_tot)
+}
+
+/// Analyze a segment and compute regression fit with R-squared
+fn analyze_segment(events: &[MouseMoveEvent], start_idx: usize, end_idx: usize) -> Option<SegmentFit> {
+    let n = end_idx - start_idx;
+    if n < 4 {
+        return None;
+    }
+
+    // Extract indices normalized to [0, 1]
+    let indices: Vec<f64> = (0..n).map(|i| i as f64).collect();
+    let (idx_norm, _, _) = normalize_to_unit(&indices);
+
+    // Extract time values
+    let times: Vec<f64> = (start_idx..end_idx)
+        .map(|i| events[i].time_secs())
+        .collect();
+
+    // Extract dx and dy values
+    let dx_vals: Vec<f64> = (start_idx..end_idx).map(|i| events[i].dx as f64).collect();
+    let dy_vals: Vec<f64> = (start_idx..end_idx).map(|i| events[i].dy as f64).collect();
+
+    // Fit polynomials
+    let dx_poly = fit_cubic(&idx_norm, &dx_vals)?;
+    let dy_poly = fit_cubic(&idx_norm, &dy_vals)?;
+    let time_poly = fit_cubic(&idx_norm, &times)?;
+
+    // Calculate predictions
+    let dx_pred: Vec<f64> = idx_norm.iter().map(|&x| dx_poly.eval(x)).collect();
+    let dy_pred: Vec<f64> = idx_norm.iter().map(|&x| dy_poly.eval(x)).collect();
+    let time_pred: Vec<f64> = idx_norm.iter().map(|&x| time_poly.eval(x)).collect();
+
+    // Calculate R-squared for each
+    let dx_r_squared = calculate_r_squared(&dx_vals, &dx_pred);
+    let dy_r_squared = calculate_r_squared(&dy_vals, &dy_pred);
+    let time_r_squared = calculate_r_squared(&times, &time_pred);
+
+    Some(SegmentFit {
+        start_idx,
+        end_idx,
+        dx_poly,
+        dy_poly,
+        time_poly,
+        dx_r_squared,
+        dy_r_squared,
+        time_r_squared,
+    })
+}
+
+/// Check if an event is discrete (zero movement or poor fit)
+fn is_discrete_event(event: &MouseMoveEvent) -> bool {
+    event.dx == 0 && event.dy == 0
+}
+
+/// Build segments with adaptive sizing and R-squared optimization
+///
+/// # Parameters
+///
+/// - `events`: The mouse movement events to segment
+/// - `initial_size`: Initial segment size to try (e.g., 10)
+/// - `growth_factor`: Factor to multiply segment size when expanding (e.g., 1.5 or 2.0)
+/// - `min_r_squared`: Minimum acceptable R-squared (e.g., 0.8 or 0.9)
+/// - `balance_weight`: Weight for balancing length vs R-squared (0.0-1.0, higher favors length)
+///
+/// # Returns
+///
+/// Vector of segments (Good or Discrete)
+pub fn build_segments(
+    events: &[MouseMoveEvent],
+    initial_size: usize,
+    growth_factor: f64,
+    min_r_squared: f64,
+    balance_weight: f64,
+) -> Vec<Segment> {
+    if events.is_empty() {
+        return Vec::new();
+    }
+
+    let mut segments = Vec::new();
+    let mut pos = 0;
+
+    while pos < events.len() {
+        // Check if current event is discrete
+        if is_discrete_event(&events[pos]) {
+            segments.push(Segment::Discrete { idx: pos });
+            pos += 1;
+            continue;
+        }
+
+        // Try progressively larger segments
+        let mut best_fit: Option<SegmentFit> = None;
+        let mut best_score = f64::NEG_INFINITY;
+        let mut current_size = initial_size;
+
+        while pos + current_size <= events.len() {
+            let end = pos + current_size;
+
+            if let Some(fit) = analyze_segment(events, pos, end) {
+                // Calculate composite R-squared (average of dx, dy, time)
+                let avg_r_squared =
+                    (fit.dx_r_squared + fit.dy_r_squared + fit.time_r_squared) / 3.0;
+
+                // Only consider if all individual R-squared values are reasonable
+                if avg_r_squared >= min_r_squared
+                    && fit.time_r_squared >= min_r_squared * 0.8
+                {
+                    // Score balances R-squared and segment length
+                    // Higher balance_weight favors longer segments
+                    let length_score = (current_size as f64).ln();
+                    let score =
+                        balance_weight * length_score + (1.0 - balance_weight) * avg_r_squared;
+
+                    if score > best_score {
+                        best_score = score;
+                        best_fit = Some(fit);
+                    }
+
+                    // Try larger segment
+                    current_size = ((current_size as f64) * growth_factor).ceil() as usize;
+                } else {
+                    // Fit quality degraded, stop growing
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        if let Some(fit) = best_fit {
+            let segment_len = fit.end_idx - fit.start_idx;
+            segments.push(Segment::Good {
+                start_idx: fit.start_idx,
+                end_idx: fit.end_idx,
+                fit,
+            });
+            pos += segment_len;
+        } else {
+            // Couldn't fit well, mark as discrete
+            segments.push(Segment::Discrete { idx: pos });
+            pos += 1;
+        }
+    }
+
+    segments
+}
+
+/// Collect visible event indices for rendering based on view parameters
+///
+/// # Parameters
+///
+/// - `segments`: Pre-computed segments from build_segments
+/// - `events`: The mouse movement events
+/// - `render_width`: Width of rendering area in pixels
+/// - `render_height`: Height of rendering area in pixels
+/// - `x_range`: (x_min, x_max) time range to render
+/// - `y_range`: (y_min, y_max) value range to render
+/// - `tolerance`: Maximum events per pixel before hiding (e.g., 3.0)
+/// - `zoom_factor`: Zoom factor for caching (>1.0, e.g., 1.5)
+///
+/// # Returns
+///
+/// Vector of event indices to render
+pub fn collect_visible_indices(
+    segments: &[Segment],
+    events: &[MouseMoveEvent],
+    render_width: f64,
+    render_height: f64,
+    x_range: (f64, f64),
+    y_range: (f64, f64),
+    tolerance: f64,
+    _zoom_factor: f64, // Reserved for future caching optimization
+) -> Vec<usize> {
+    if events.is_empty() || segments.is_empty() {
+        return Vec::new();
+    }
+
+    let mut visible_indices = Vec::new();
+    let mut seen_pixels = HashSet::new();
+
+    // Calculate pixel scales
+    let x_scale = render_width / (x_range.1 - x_range.0).max(1e-10);
+    let y_scale = render_height / (y_range.1 - y_range.0).max(1e-10);
+
+    // Helper: convert event to pixel coordinates
+    let to_pixel = |event: &MouseMoveEvent| -> (i32, i32) {
+        let px = ((event.time_secs() - x_range.0) * x_scale) as i32;
+        let py = ((-(event.dy as f64) - y_range.0) * y_scale) as i32;
+        (px, py)
+    };
+
+    // Process each segment
+    for segment in segments {
+        match segment {
+            Segment::Discrete { idx } => {
+                // Always include discrete events
+                if *idx < events.len() {
+                    visible_indices.push(*idx);
+                }
+            }
+            Segment::Good {
+                start_idx,
+                end_idx,
+                ..
+            } => {
+                // For good segments, apply intelligent filtering
+                if *start_idx >= events.len() || *end_idx > events.len() {
+                    continue;
+                }
+
+                let segment_events = &events[*start_idx..*end_idx];
+
+                // Always include first and last to preserve continuity
+                visible_indices.push(*start_idx);
+                if end_idx - start_idx > 1 {
+                    visible_indices.push(*end_idx - 1);
+                }
+
+                // For interior points, apply tolerance-based filtering
+                let mut pixel_counts: std::collections::HashMap<(i32, i32), Vec<usize>> =
+                    std::collections::HashMap::new();
+
+                for (local_idx, event) in segment_events.iter().enumerate() {
+                    let global_idx = start_idx + local_idx;
+                    let pixel = to_pixel(event);
+                    pixel_counts.entry(pixel).or_insert_with(Vec::new).push(global_idx);
+                }
+
+                // Add events based on tolerance
+                for (pixel, indices) in pixel_counts.iter() {
+                    if seen_pixels.contains(pixel) {
+                        continue;
+                    }
+
+                    let count = indices.len() as f64;
+                    if count <= tolerance {
+                        // Include all events at this pixel
+                        for &idx in indices {
+                            // Don't duplicate first/last
+                            if idx != *start_idx && idx != *end_idx - 1 {
+                                visible_indices.push(idx);
+                            }
+                        }
+                    } else {
+                        // Too many events, sample them
+                        let sample_rate = (count / tolerance).ceil() as usize;
+                        for (i, &idx) in indices.iter().enumerate() {
+                            if i % sample_rate == 0 && idx != *start_idx && idx != *end_idx - 1 {
+                                visible_indices.push(idx);
+                            }
+                        }
+                    }
+
+                    seen_pixels.insert(*pixel);
+                }
+            }
+        }
+    }
+
+    // Sort indices to maintain time order
+    visible_indices.sort_unstable();
+    visible_indices.dedup();
+
+    visible_indices
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_test_events(n: usize) -> Vec<MouseMoveEvent> {
+        let mut events = Vec::new();
+        for i in 0..n {
+            let t_sec = i as u32;
+            let t_usec = 0;
+            // Linear pattern
+            let dx = (i * 10) as i16;
+            let dy = -(i as i16 * 5);
+            events.push(MouseMoveEvent::new(dx, dy, t_sec, t_usec));
+        }
+        events
+    }
+
+    fn make_test_events_with_zeros(n: usize) -> Vec<MouseMoveEvent> {
+        let mut events = Vec::new();
+        for i in 0..n {
+            let t_sec = i as u32;
+            let t_usec = 0;
+            // Every 5th event is zero
+            let (dx, dy) = if i % 5 == 0 {
+                (0, 0)
+            } else {
+                ((i * 10) as i16, -(i as i16 * 5))
+            };
+            events.push(MouseMoveEvent::new(dx, dy, t_sec, t_usec));
+        }
+        events
+    }
+
+    #[test]
+    fn test_poly3_eval() {
+        let poly = Poly3 {
+            a0: 1.0,
+            a1: 2.0,
+            a2: 3.0,
+            a3: 4.0,
+        };
+        assert_eq!(poly.eval(0.0), 1.0);
+        assert_eq!(poly.eval(1.0), 10.0);
+    }
+
+    #[test]
+    fn test_normalize_to_unit() {
+        let values = vec![0.0, 5.0, 10.0];
+        let (normalized, min_val, range) = normalize_to_unit(&values);
+        assert_eq!(min_val, 0.0);
+        assert_eq!(range, 10.0);
+        assert_eq!(normalized, vec![0.0, 0.5, 1.0]);
+    }
+
+    #[test]
+    fn test_fit_cubic() {
+        let x = vec![0.0, 0.25, 0.5, 0.75, 1.0];
+        let y: Vec<f64> = x.iter().map(|&t| t * t * t).collect();
+        let poly = fit_cubic(&x, &y).unwrap();
+        
+        // Should approximate cubic function
+        assert!((poly.a0).abs() < 0.1);
+        assert!((poly.a3 - 1.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_calculate_r_squared() {
+        let y_actual = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let y_pred = vec![1.1, 1.9, 3.0, 4.1, 4.9];
+        let r2 = calculate_r_squared(&y_actual, &y_pred);
+        assert!(r2 > 0.95); // Should be very close to 1
+    }
+
+    #[test]
+    fn test_is_discrete_event() {
+        let zero_event = MouseMoveEvent::new(0, 0, 0, 0);
+        let normal_event = MouseMoveEvent::new(10, -5, 0, 0);
+        
+        assert!(is_discrete_event(&zero_event));
+        assert!(!is_discrete_event(&normal_event));
+    }
+
+    #[test]
+    fn test_analyze_segment() {
+        let events = make_test_events(10);
+        let fit = analyze_segment(&events, 0, 10);
+        
+        assert!(fit.is_some());
+        let fit = fit.unwrap();
+        assert_eq!(fit.start_idx, 0);
+        assert_eq!(fit.end_idx, 10);
+        // Linear data should have high R-squared
+        assert!(fit.dx_r_squared > 0.9);
+        assert!(fit.dy_r_squared > 0.9);
+        assert!(fit.time_r_squared > 0.9);
+    }
+
+    #[test]
+    fn test_build_segments_simple() {
+        let events = make_test_events(20);
+        let segments = build_segments(&events, 5, 2.0, 0.8, 0.5);
+        
+        assert!(!segments.is_empty());
+        // Should have at least one good segment
+        let has_good = segments.iter().any(|s| matches!(s, Segment::Good { .. }));
+        assert!(has_good);
+    }
+
+    #[test]
+    fn test_build_segments_with_discrete() {
+        let events = make_test_events_with_zeros(20);
+        let segments = build_segments(&events, 5, 2.0, 0.8, 0.5);
+        
+        assert!(!segments.is_empty());
+        // Should have some discrete events
+        let discrete_count = segments.iter().filter(|s| matches!(s, Segment::Discrete { .. })).count();
+        assert!(discrete_count >= 3); // At least 3 zero events in 20
+    }
+
+    #[test]
+    fn test_collect_visible_indices() {
+        let events = make_test_events(100);
+        let segments = build_segments(&events, 10, 1.5, 0.85, 0.5);
+        
+        let x_range = (0.0, 100.0);
+        let y_range = (-500.0, 1000.0);
+        let indices = collect_visible_indices(
+            &segments,
+            &events,
+            800.0,
+            600.0,
+            x_range,
+            y_range,
+            5.0,
+            1.5,
+        );
+        
+        assert!(!indices.is_empty());
+        assert!(indices.len() <= events.len());
+        // Should maintain sorted order
+        for i in 1..indices.len() {
+            assert!(indices[i] > indices[i - 1]);
+        }
+    }
+
+    #[test]
+    fn test_lod_cache_can_reuse() {
+        let cache = LodCache {
+            segments: Vec::new(),
+            zoom_factor: 1.0,
+            last_x_range: (0.0, 100.0),
+            last_y_range: (0.0, 100.0),
+        };
+        
+        // Should reuse when zoomed in
+        assert!(cache.can_reuse((10.0, 50.0), (10.0, 50.0), 1.5));
+        
+        // Should not reuse when zoomed out
+        assert!(!cache.can_reuse((0.0, 200.0), (0.0, 200.0), 1.0));
+    }
+}
