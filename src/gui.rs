@@ -22,15 +22,8 @@ pub struct MouseAnalyzerGui {
     captured_events: Vec<MouseMoveEvent>,       // Events snapshot when capture stopped
     last_f2_state: bool,                        // For edge detection
     target_device: Option<crate::TargetDevice>, // Store target device for restarts
-    // OLD LOD state for intelligent updates (indices-based) - COMMENTED OUT
-    // cached_lod_indices: Vec<usize>,
-    // lod_pyramid: Vec<Vec<usize>>, // Lazy LOD pyramid for fast lookups
-    // last_plot_bounds: Option<PlotBounds>,
-    // last_target_points: Option<usize>, // Track target_points for coarsen-from-previous
-    // last_events_len: usize,            // For cache invalidation on capture reset
-    // lod_threshold: f64,                // Threshold for triggering LOD recalculation (0.1 = 10% change)
     
-    // NEW ADVANCED LOD state
+    // Advanced LOD state
     advanced_lod_segments: Vec<Segment>,
     advanced_lod_last_events_len: usize,
     advanced_lod_last_bounds: Option<PlotBounds>,
@@ -57,15 +50,8 @@ impl MouseAnalyzerGui {
             captured_events: Vec::new(),
             last_f2_state: false,
             target_device,
-            // OLD LOD - commented out
-            // cached_lod_indices: Vec::new(),
-            // lod_pyramid: Vec::new(),
-            // last_plot_bounds: None,
-            // last_target_points: None,
-            // last_events_len: 0,
-            // lod_threshold: 0.1, // 10% change threshold
             
-            // NEW ADVANCED LOD initialization
+            // Advanced LOD initialization
             advanced_lod_segments: Vec::new(),
             advanced_lod_last_events_len: 0,
             advanced_lod_last_bounds: None,
@@ -151,169 +137,6 @@ impl MouseAnalyzerGui {
 
         indices
     }
-
-    // OLD LOD FUNCTION - COMMENTED OUT (replaced with apply_advanced_lod_indices)
-    // This function used bucket-based sampling with min/max preservation
-    // The new advanced LOD uses cubic polynomial regression with R-squared analysis
-    
-    /*
-    fn apply_lod_indices(&mut self, events: &[MouseMoveEvent], visible_width: f64, plot_bounds: Option<&PlotBounds>) -> Vec<usize> {
-        use std::collections::HashSet;
-
-        if events.is_empty() {
-            return Vec::new();
-        }
-
-        // Check if cache needs invalidation due to events change
-        if events.len() != self.last_events_len {
-            self.cached_lod_indices.clear();
-            self.lod_pyramid.clear();
-            self.last_target_points = None;
-            self.last_events_len = events.len();
-        }
-
-        // Constants for tuning - optimized based on real mouse capture analysis
-        const MARGIN_PX: f64 = 8.0;
-        const COLINEARITY_TOL: f64 = 0.6;
-        const MIN_POINTS_PER_PIXEL: f64 = 0.5; // Minimum for 8kHz+ high-density devices
-        const MAX_POINTS_PER_PIXEL: f64 = 3.0; // Maximum when zoomed in
-        const HIGH_DENSITY_THRESHOLD: f64 = 5.0; // Threshold for aggressive reduction
-
-        // Binary search to find visible slice
-        let (start_idx, end_idx) = if let Some(bounds) = plot_bounds {
-            // Add margin in time units
-            let time_range = bounds.x_max - bounds.x_min;
-            let margin_time = if time_range > 0.0 { (MARGIN_PX / visible_width) * time_range } else { 0.0 };
-
-            let x_min_with_margin = bounds.x_min - margin_time;
-            let x_max_with_margin = bounds.x_max + margin_time;
-
-            // Use partition_point for binary search
-            let start = events.partition_point(|e| e.time_secs() < x_min_with_margin);
-            let end = events.partition_point(|e| e.time_secs() <= x_max_with_margin);
-
-            (start, end)
-        } else {
-            (0, events.len())
-        };
-
-        let visible_count = end_idx.saturating_sub(start_idx);
-
-        if visible_count == 0 {
-            return Vec::new();
-        }
-
-        // Calculate target points based on data density and visible width
-        // When many events are visible (zoomed out), reduce points per pixel
-        // When few events are visible (zoomed in), use more points per pixel
-        // Optimized for 1kHz-8kHz mouse report rates based on real capture analysis
-        let data_density = visible_count as f64 / visible_width;
-
-        // Adaptive points per pixel based on data density
-        // Very high density (8kHz+, >5.0 events/pixel) -> 0.5 points/pixel
-        // High density (zoomed out, >3.0) -> 1.0 points/pixel
-        // Low density (zoomed in, <1.0) -> use all points
-        let points_per_pixel = if data_density > HIGH_DENSITY_THRESHOLD {
-            // Very high density (e.g., 8kHz sensor fully zoomed out): aggressive reduction
-            MIN_POINTS_PER_PIXEL
-        } else if data_density > MAX_POINTS_PER_PIXEL {
-            // High density: use 1.0 points per pixel
-            1.0
-        } else if data_density < 1.0 {
-            // Very low density: use all points (no downsampling)
-            data_density
-        } else {
-            // Medium density: scale between 1.0 and 3.0 points per pixel
-            // As density increases from 1.0 to 3.0, reduce from 3.0 to 1.0 points/pixel
-            let density_factor = (MAX_POINTS_PER_PIXEL - data_density) / (MAX_POINTS_PER_PIXEL - 1.0);
-            1.0 + density_factor * (MAX_POINTS_PER_PIXEL - 1.0)
-        };
-
-        let target_points = (visible_width * points_per_pixel).max(visible_width * MIN_POINTS_PER_PIXEL) as usize;
-        let target_points = target_points.min(visible_count); // Never exceed visible count
-
-        if visible_count <= target_points {
-            // No downsampling needed
-            return (start_idx..end_idx).collect();
-        }
-
-        // Check for coarsen-from-previous fast path (zooming out)
-        if let Some(last_target) = self.last_target_points {
-            if target_points < last_target && !self.cached_lod_indices.is_empty() {
-                // Coarsen from cached indices
-                let step = self.cached_lod_indices.len() / target_points.max(1);
-                let step = step.max(1);
-
-                let coarsened: Vec<usize> = self.cached_lod_indices.iter().step_by(step).copied().collect();
-
-                self.last_target_points = Some(target_points);
-                return coarsened;
-            }
-        }
-
-        // Full LOD computation with trend preservation
-        let mut selected_indices = Vec::with_capacity(target_points);
-        let mut dedup_set = HashSet::new();
-
-        // Calculate bucket size
-        let bucket_size = visible_count / target_points.max(1);
-        let bucket_size = bucket_size.max(1);
-
-        for bucket_start in (start_idx..end_idx).step_by(bucket_size) {
-            let bucket_end = (bucket_start + bucket_size).min(end_idx);
-
-            if bucket_start >= bucket_end {
-                continue;
-            }
-
-            // Collect indices for this bucket with trend preservation
-            // Include first and last of bucket
-            let first_idx = bucket_start;
-            let last_idx = bucket_end - 1;
-
-            // Find min/max dx and dy in bucket
-            let mut min_dx_idx = first_idx;
-            let mut max_dx_idx = first_idx;
-            let mut min_dy_idx = first_idx;
-            let mut max_dy_idx = first_idx;
-
-            for idx in bucket_start..bucket_end {
-                if events[idx].dx < events[min_dx_idx].dx {
-                    min_dx_idx = idx;
-                }
-                if events[idx].dx > events[max_dx_idx].dx {
-                    max_dx_idx = idx;
-                }
-                if events[idx].dy < events[min_dy_idx].dy {
-                    min_dy_idx = idx;
-                }
-                if events[idx].dy > events[max_dy_idx].dy {
-                    max_dy_idx = idx;
-                }
-            }
-
-            // Add unique indices using time deduplication
-            for &idx in &[first_idx, last_idx, min_dx_idx, max_dx_idx, min_dy_idx, max_dy_idx] {
-                let time_bits = events[idx].time_secs().to_bits();
-                if dedup_set.insert(time_bits) {
-                    selected_indices.push(idx);
-                }
-            }
-        }
-
-        // Sort indices to maintain time order
-        selected_indices.sort_unstable();
-
-        // Validate all indices are within bounds
-        debug_assert!(selected_indices.iter().all(|&idx| idx < events.len()), "All indices should be within events bounds");
-
-        // Update cache
-        self.cached_lod_indices = selected_indices.clone();
-        self.last_target_points = Some(target_points);
-
-        selected_indices
-    }
-    */
 
     fn calculate_stats(&self, events: &[MouseMoveEvent]) -> Stats {
         if events.is_empty() {
@@ -406,14 +229,8 @@ impl eframe::App for MouseAnalyzerGui {
                 self.stop_flag.store(true, Ordering::SeqCst);
                 self.captured_events = self.events.lock().unwrap().clone();
                 self.is_capturing = false;
-                // Clear LOD cache since we have new data - OLD LOD (commented out)
-                // self.cached_lod_indices.clear();
-                // self.lod_pyramid.clear();
-                // self.last_plot_bounds = None;
-                // self.last_target_points = None;
-                // self.last_events_len = self.captured_events.len();
                 
-                // Clear NEW ADVANCED LOD cache
+                // Clear Advanced LOD cache since we have new data
                 self.advanced_lod_segments.clear();
                 self.advanced_lod_last_events_len = 0;
                 self.advanced_lod_last_bounds = None;
@@ -423,14 +240,8 @@ impl eframe::App for MouseAnalyzerGui {
                 // Clear previous data
                 self.events.lock().unwrap().clear();
                 self.captured_events.clear();
-                // OLD LOD cache clear (commented out)
-                // self.cached_lod_indices.clear();
-                // self.lod_pyramid.clear();
-                // self.last_plot_bounds = None;
-                // self.last_target_points = None;
-                // self.last_events_len = 0;
                 
-                // Clear NEW ADVANCED LOD cache
+                // Clear Advanced LOD cache
                 self.advanced_lod_segments.clear();
                 self.advanced_lod_last_events_len = 0;
                 self.advanced_lod_last_bounds = None;
@@ -596,18 +407,7 @@ impl eframe::App for MouseAnalyzerGui {
                                     y_max: bounds.max()[1],
                                 };
 
-                                // OLD LOD CALL - COMMENTED OUT
-                                // Check if we need to recalculate LOD
-                                // let needs_lod_update = self.bounds_changed_significantly(&current_bounds) || self.cached_lod_indices.is_empty();
-                                // let lod_indices = if needs_lod_update {
-                                //     // Recalculate LOD with current bounds
-                                //     self.apply_lod_indices(&display_events, available_width as f64, Some(&current_bounds))
-                                // } else {
-                                //     // Use cached LOD indices
-                                //     self.cached_lod_indices.clone()
-                                // };
-
-                                // NEW ADVANCED LOD CALL
+                                // Apply Advanced LOD
                                 let lod_indices = self.apply_advanced_lod_indices(&display_events, available_width as f64, Some(&current_bounds));
 
                                 // Helper to safely map indices to plot points

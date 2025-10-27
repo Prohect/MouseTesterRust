@@ -4,6 +4,12 @@
 //! for time consistency and data quality, segments them based on cubic polynomial regression
 //! quality (R-squared), and provides efficient view-dependent filtering with caching.
 //!
+//! # Dependencies
+//!
+//! This module uses the `nalgebra` crate for numerical linear algebra operations,
+//! specifically SVD (Singular Value Decomposition) for stable least-squares fitting
+//! of cubic polynomials to mouse movement data.
+//!
 //! # Key Features
 //!
 //! - **Time Consistency Analysis**: Detects events with poor time linearity (report rate issues)
@@ -37,6 +43,11 @@
 use crate::mouse_event::MouseMoveEvent;
 use nalgebra::{DMatrix, DVector};
 use std::collections::HashSet;
+
+// Constants for numerical stability and tolerance
+const SVD_TOLERANCE: f64 = 1e-10; // Tolerance for SVD solving
+const MIN_RANGE_VALUE: f64 = 1e-10; // Minimum range to prevent division by zero
+const ZOOM_TOLERANCE_FACTOR: f64 = 0.9; // 10% tolerance for zoom factor comparison
 
 /// Cubic polynomial coefficients: f(t) = a0 + a1*t + a2*t^2 + a3*t^3
 #[derive(Debug, Clone, Copy)]
@@ -105,7 +116,7 @@ impl LodCache {
         // Cache is valid if new view is within cached view (zoomed in)
         let x_within = x_range.0 >= self.last_x_range.0 && x_range.1 <= self.last_x_range.1;
         let y_within = y_range.0 >= self.last_y_range.0 && y_range.1 <= self.last_y_range.1;
-        let zoom_ok = zoom_factor >= self.zoom_factor * 0.9; // Allow 10% tolerance
+        let zoom_ok = zoom_factor >= self.zoom_factor * ZOOM_TOLERANCE_FACTOR;
 
         x_within && y_within && zoom_ok
     }
@@ -119,7 +130,7 @@ fn normalize_to_unit(values: &[f64]) -> (Vec<f64>, f64, f64) {
 
     let min_val = values.iter().copied().fold(f64::INFINITY, f64::min);
     let max_val = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let range = (max_val - min_val).max(1e-10);
+    let range = (max_val - min_val).max(MIN_RANGE_VALUE);
 
     let normalized: Vec<f64> = values.iter().map(|&v| (v - min_val) / range).collect();
 
@@ -127,6 +138,9 @@ fn normalize_to_unit(values: &[f64]) -> (Vec<f64>, f64, f64) {
 }
 
 /// Fit a cubic polynomial using least-squares with SVD
+///
+/// Requires at least 4 data points for cubic fitting.
+/// Returns None if fewer than 4 points are provided or if SVD solving fails.
 fn fit_cubic(x_norm: &[f64], y: &[f64]) -> Option<Poly3> {
     let n = x_norm.len();
     if n < 4 {
@@ -149,7 +163,7 @@ fn fit_cubic(x_norm: &[f64], y: &[f64]) -> Option<Poly3> {
     let b = DVector::from_row_slice(y);
 
     let svd = a.svd(true, true);
-    let coeffs = svd.solve(&b, 1e-10).ok()?;
+    let coeffs = svd.solve(&b, SVD_TOLERANCE).ok()?;
 
     Some(Poly3 {
         a0: coeffs[0],
