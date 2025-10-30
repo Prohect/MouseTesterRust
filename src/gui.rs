@@ -632,9 +632,11 @@ impl eframe::App for MouseAnalyzerGui {
                                 
                                 // Draw regression curves for Good segments
                                 // These show the polynomial fit used for LOD analysis
+                                const REGRESSION_CURVE_SAMPLES: usize = 50;
                                 for segment in &self.lod_segments {
                                     if let Segment::Good { start_idx, end_idx, fit } = segment {
-                                        if *start_idx >= display_events.len() || *end_idx > display_events.len() {
+                                        // Validate indices
+                                        if *start_idx >= display_events.len() || *end_idx > display_events.len() || *end_idx <= *start_idx {
                                             continue;
                                         }
                                         
@@ -648,12 +650,11 @@ impl eframe::App for MouseAnalyzerGui {
                                         }
                                         
                                         // Sample the polynomial fit - use enough samples for smooth curves
-                                        let n_samples = 50;
                                         let mut dx_curve_points = Vec::new();
                                         let mut dy_curve_points = Vec::new();
                                         
-                                        for i in 0..=n_samples {
-                                            let t_norm = i as f64 / n_samples as f64;
+                                        for i in 0..=REGRESSION_CURVE_SAMPLES {
+                                            let t_norm = i as f64 / REGRESSION_CURVE_SAMPLES as f64;
                                             
                                             // Interpolate actual time
                                             let t_actual = start_time + (end_time - start_time) * t_norm;
