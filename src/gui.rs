@@ -170,7 +170,7 @@ impl MouseAnalyzerGui {
             println!("Created {} segments", self.advanced_lod_segments.len());
             println!("Created {} discrete segments", self.advanced_lod_segments.iter().find(|&s| if let Segment::Discrete { idx: _ } = s {
                 true
-            }else{false}).iter().count());
+            }else{false}).into_iter().count());
 
             // Calculate error points after building segments
             let all_error_points = self.calculate_error_points(events);
