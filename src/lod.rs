@@ -1,73 +1,53 @@
-//! Level-of-Detail (LOD) module for offline hierarchical segmentation
+//! Level-of-Detail (LOD) algorithm with time consistency and regression-based segmentation
 //!
-//! This module implements hierarchical segmentation of mouse movement data based on
-//! cubic polynomial fits. It's designed for static plotting workflows where the full
-//! event stream is captured first, then processed offline to build a segment tree.
-//! The tree can then be queried at different tolerance levels for efficient rendering
-//! with automatic point reduction.
+//! This module implements an intelligent LOD algorithm that analyzes mouse movement events
+//! for time consistency and data quality, segments them based on cubic polynomial regression
+//! quality (R-squared), and provides efficient view-dependent filtering with caching.
 //!
-//! # Usage
+//! # Dependencies
 //!
-//! ```rust,ignore
-//! use mouse_tester::lod::{build_segment_tree, collect_for_view};
-//! use mouse_tester::mouse_event::MouseMoveEvent;
+//! This module uses the `nalgebra` crate for numerical linear algebra operations,
+//! specifically SVD (Singular Value Decomposition) for stable least-squares fitting
+//! of cubic polynomials to mouse movement data.
 //!
-//! // After capturing events
-//! let events: Vec<MouseMoveEvent> = /* ... */;
+//! # Key Features
 //!
-//! // Build segment tree (one-time offline processing)
-//! let tree = build_segment_tree(
-//!     &events,
-//!     0,
-//!     events.len(),
-//!     5,      // min_pts: minimum points per segment
-//!     1000,   // max_pts: maximum points before splitting
-//!     1.0,    // px_scale: pixel scale factor
-//!     1.0     // tol_px: build tolerance in pixels
-//! );
+//! - **Time Consistency Analysis**: Detects events with poor time linearity (report rate issues)
+//! - **Discrete Event Detection**: Identifies zero-movement events and outliers
+//! - **Adaptive Segmentation**: Creates segments with optimal R-squared and length balance
+//! - **Smart Caching**: Caches regression results and reuses them for zoom operations
+//! - **View-Dependent Filtering**: Hides redundant events based on rendering resolution
 //!
-//! // Collect points for a specific view tolerance (higher = more reduction)
-//! let mut view_points = Vec::new();
-//! collect_for_view(&tree, &events, 1.0, 5.0, &mut view_points);
-//! // view_points now contains reduced set of (time_micros, dx, dy) tuples
-//! // Typical reduction: 40-99% depending on data and view tolerance
-//! ```
+//! # Algorithm Overview
 //!
-//! # How LOD Works
+//! 1. **Segment Analysis Phase**:
+//!    - Start with initial segment size (e.g., 10 events)
+//!    - Try larger segments by multiplying size by growth factor (1.5 or 2)
+//!    - For each segment size, compute cubic polynomial fit for dx, dy, and time vs index
+//!    - Calculate R-squared to measure fit quality
+//!    - Balance between segment length and R-squared (prefer longer segments with good R²)
+//!    - Mark discrete events: zero dx/dy, or poor time/position consistency
 //!
-//! 1. **Tree Building**: Segments are recursively split when polynomial fit RMSE exceeds
-//!    build tolerance (tol_px), creating a hierarchical tree structure.
+//! 2. **Caching Phase**:
+//!    - Store segment boundaries with their regression parameters
+//!    - Cache R-squared values for each segment
+//!    - Store indices of discrete events separately
 //!
-//! 2. **View Collection**: When collecting for a view, segments with RMSE below the
-//!    view tolerance use sampled points (every Nth point) rather than all raw points,
-//!    providing automatic reduction while preserving visual quality.
-//!
-//! 3. **Adaptive Sampling**: Small segments (<10 points) output all points, larger
-//!    segments with acceptable error output sampled points based on segment size.
-//!
-//! # Performance Recommendations
-//!
-//! - **min_pts**: 5-10 points minimum per segment (prevents over-segmentation)
-//! - **max_pts**: 500-1000 points (balances tree depth vs. fit quality)
-//! - **tol_px** (build): 0.5-2.0 pixels (splitting threshold during tree construction)
-//! - **view_tol_px**: 0.5-5.0 pixels (view-dependent reduction tolerance)
-//!   - 0.5-1.0: High detail, minimal reduction (0-50%)
-//!   - 2.0-3.0: Balanced quality/performance (50-90% reduction)
-//!   - 5.0+: Maximum reduction for overview (90-99% reduction)
-//! - **px_scale**: Set based on your display DPI and zoom level
-//!
-//! The module uses SVD decomposition for numerical stability in least-squares fitting
-//! and normalizes time coordinates to [-1, 1] to improve conditioning.
-//!
-//! # Real-World Performance
-//!
-//! Based on analysis of 167,565 real mouse events:
-//! - 8kHz sensor @ 5px tolerance: 99% reduction (85,752 → ~858 points)
-//! - 1kHz sensor @ 5px tolerance: 46% reduction (5,853 → ~3,160 points)
-//! - Quality remains visually identical at appropriate tolerance levels
+//! 3. **View Collection Phase**:
+//!    - Given rendering resolution, x/y ranges, tolerance, and zoom factor
+//!    - Calculate which events map to same pixel on screen
+//!    - Keep first and last event of each good segment (preserve continuity)
+//!    - Apply tolerance: hide events if more than tolerance map to same pixel
+//!    - Return list of event indices that should be rendered
 
 use crate::mouse_event::MouseMoveEvent;
 use nalgebra::{DMatrix, DVector};
+use std::collections::HashSet;
+
+// Constants for numerical stability and tolerance
+const SVD_TOLERANCE: f64 = 1e-10; // Tolerance for SVD solving
+const MIN_RANGE_VALUE: f64 = 1e-10; // Minimum range to prevent division by zero
+const ZOOM_TOLERANCE_FACTOR: f64 = 0.9; // 10% tolerance for zoom factor comparison
 
 /// Cubic polynomial coefficients: f(t) = a0 + a1*t + a2*t^2 + a3*t^3
 #[derive(Debug, Clone, Copy)]
@@ -90,75 +70,91 @@ impl Poly3 {
     }
 }
 
-/// A node in the hierarchical segment tree
-///
-/// Each node represents a time range [start, end) and stores cubic polynomial
-/// approximations for both dx and dy movements, along with the RMSE error metric.
+/// Result of regression analysis for a segment
 #[derive(Debug, Clone)]
-pub struct SegmentNode {
-    /// Start index in the events array (inclusive)
-    pub start: usize,
-    /// End index in the events array (exclusive)
-    pub end: usize,
-    /// Cubic polynomial coefficients for dx
-    pub coeff_x: Poly3,
-    /// Cubic polynomial coefficients for dy
-    pub coeff_y: Poly3,
-    /// Root Mean Square Error in pixel space
-    pub rmse_px: f64,
-    /// Child nodes (empty for leaf nodes)
-    pub children: Vec<SegmentNode>,
+pub struct SegmentFit {
+    pub start_idx: usize,
+    pub end_idx: usize,
+    pub dx_poly: Poly3,
+    pub dy_poly: Poly3,
+    pub time_poly: Poly3, // Time vs index fit
+    pub dx_r_squared: f64,
+    pub dy_r_squared: f64,
+    pub time_r_squared: f64, // Time consistency metric
 }
 
-/// Normalize times to [-1, 1] range for better numerical conditioning
-///
-/// Returns (normalized_times, time_offset, time_scale) where:
-/// - normalized_times: times mapped to [-1, 1]
-/// - time_offset: offset to subtract from original times
-/// - time_scale: scale factor for normalization
-fn normalize_times(times: &[f64]) -> (Vec<f64>, f64, f64) {
-    if times.is_empty() {
+/// Represents a segment of events with classification
+#[derive(Debug, Clone)]
+pub enum Segment {
+    /// Good segment with high-quality polynomial fit
+    Good { start_idx: usize, end_idx: usize, fit: SegmentFit },
+    /// Discrete event that doesn't fit well
+    Discrete { idx: usize },
+}
+
+/// Cached LOD analysis result
+#[derive(Debug, Clone)]
+pub struct LodCache {
+    pub segments: Vec<Segment>,
+    pub zoom_factor: f64,
+    pub last_x_range: (f64, f64),
+    pub last_y_range: (f64, f64),
+}
+
+impl LodCache {
+    /// Check if cached result can be reused for given view
+    pub fn can_reuse(&self, x_range: (f64, f64), y_range: (f64, f64), zoom_factor: f64) -> bool {
+        // Cache is valid if new view is within cached view (zoomed in)
+        let x_within = x_range.0 >= self.last_x_range.0 && x_range.1 <= self.last_x_range.1;
+        let y_within = y_range.0 >= self.last_y_range.0 && y_range.1 <= self.last_y_range.1;
+        let zoom_ok = zoom_factor >= self.zoom_factor * ZOOM_TOLERANCE_FACTOR;
+
+        x_within && y_within && zoom_ok
+    }
+}
+
+/// Normalize values to [0, 1] range for better numerical conditioning
+fn normalize_to_unit(values: &[f64]) -> (Vec<f64>, f64, f64) {
+    if values.is_empty() {
         return (Vec::new(), 0.0, 1.0);
     }
 
-    let t_min = times.iter().copied().fold(f64::INFINITY, f64::min);
-    let t_max = times.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let t_mid = (t_min + t_max) / 2.0;
-    let t_range = (t_max - t_min).max(1e-10); // Avoid division by zero
-    let t_scale = 2.0 / t_range;
+    let min_val = values.iter().copied().fold(f64::INFINITY, f64::min);
+    let max_val = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let range = (max_val - min_val).max(MIN_RANGE_VALUE);
 
-    let normalized: Vec<f64> = times.iter().map(|&t| (t - t_mid) * t_scale).collect();
+    let normalized: Vec<f64> = values.iter().map(|&v| (v - min_val) / range).collect();
 
-    (normalized, t_mid, t_scale)
+    (normalized, min_val, range)
 }
 
-/// Fit a cubic polynomial to data using least-squares with SVD decomposition
+/// Fit a cubic polynomial using least-squares with SVD
 ///
-/// Returns the polynomial coefficients or None if fitting fails
-fn fit_cubic_poly(t_norm: &[f64], y: &[f64]) -> Option<Poly3> {
-    let n = t_norm.len();
+/// Requires at least 4 data points for cubic fitting.
+/// Returns None if fewer than 4 points are provided or if SVD solving fails.
+fn fit_cubic(x_norm: &[f64], y: &[f64]) -> Option<Poly3> {
+    let n = x_norm.len();
     if n < 4 {
-        return None; // Need at least 4 points for cubic fit
+        return None;
     }
 
-    // Build design matrix: [1, t, t^2, t^3]
+    // Build design matrix: [1, x, x^2, x^3]
     let mut a_data = vec![0.0; n * 4];
     for i in 0..n {
-        let t = t_norm[i];
-        let t2 = t * t;
-        let t3 = t2 * t;
+        let x = x_norm[i];
+        let x2 = x * x;
+        let x3 = x2 * x;
         a_data[i * 4] = 1.0;
-        a_data[i * 4 + 1] = t;
-        a_data[i * 4 + 2] = t2;
-        a_data[i * 4 + 3] = t3;
+        a_data[i * 4 + 1] = x;
+        a_data[i * 4 + 2] = x2;
+        a_data[i * 4 + 3] = x3;
     }
 
     let a = DMatrix::from_row_slice(n, 4, &a_data);
     let b = DVector::from_row_slice(y);
 
-    // Solve using SVD for numerical stability with overdetermined systems
     let svd = a.svd(true, true);
-    let coeffs = svd.solve(&b, 1e-10).ok()?;
+    let coeffs = svd.solve(&b, SVD_TOLERANCE).ok()?;
 
     Some(Poly3 {
         a0: coeffs[0],
@@ -168,164 +164,304 @@ fn fit_cubic_poly(t_norm: &[f64], y: &[f64]) -> Option<Poly3> {
     })
 }
 
-/// Compute RMSE in pixel space for the fit
-fn compute_rmse_px(events: &[MouseMoveEvent], start: usize, end: usize, t_norm: &[f64], coeff_x: &Poly3, coeff_y: &Poly3, px_scale: f64) -> f64 {
-    let n = end - start;
-    if n == 0 {
+/// Calculate R-squared (coefficient of determination) for a fit
+fn calculate_r_squared(y_actual: &[f64], y_pred: &[f64]) -> f64 {
+    if y_actual.len() != y_pred.len() || y_actual.is_empty() {
         return 0.0;
     }
 
-    let mut sum_sq_error = 0.0;
-    for i in 0..n {
-        let event = &events[start + i];
-        let t = t_norm[i];
+    let n = y_actual.len() as f64;
+    let y_mean = y_actual.iter().sum::<f64>() / n;
 
-        let dx_pred = coeff_x.eval(t);
-        let dy_pred = coeff_y.eval(t);
+    let ss_tot: f64 = y_actual.iter().map(|&y| (y - y_mean).powi(2)).sum();
+    let ss_res: f64 = y_actual.iter().zip(y_pred.iter()).map(|(&y_a, &y_p)| (y_a - y_p).powi(2)).sum();
 
-        let dx_err = (event.dx as f64 - dx_pred) * px_scale;
-        let dy_err = (event.dy as f64 - dy_pred) * px_scale;
-
-        sum_sq_error += dx_err * dx_err + dy_err * dy_err;
+    if ss_tot < 1e-10 {
+        // If variance is near zero, perfect fit
+        return 1.0;
     }
 
-    (sum_sq_error / (n as f64)).sqrt()
+    1.0 - (ss_res / ss_tot)
 }
 
-/// Build a hierarchical segment tree for the given event range
+/// Analyze a segment and compute regression fit with R-squared
+fn analyze_segment(events: &[MouseMoveEvent], start_idx: usize, end_idx: usize) -> Option<SegmentFit> {
+    let n = end_idx - start_idx;
+    if n < 4 {
+        return None;
+    }
+
+    // Extract indices normalized to [0, 1]
+    let indices: Vec<f64> = (0..n).map(|i| i as f64).collect();
+    let (idx_norm, _, _) = normalize_to_unit(&indices);
+
+    // Extract time values
+    let times: Vec<f64> = (start_idx..end_idx).map(|i| events[i].time_secs()).collect();
+
+    // Extract dx and dy values
+    let dx_vals: Vec<f64> = (start_idx..end_idx).map(|i| events[i].dx as f64).collect();
+    let dy_vals: Vec<f64> = (start_idx..end_idx).map(|i| events[i].dy as f64).collect();
+
+    // Fit polynomials
+    let dx_poly = fit_cubic(&idx_norm, &dx_vals)?;
+    let dy_poly = fit_cubic(&idx_norm, &dy_vals)?;
+    let time_poly = fit_cubic(&idx_norm, &times)?;
+
+    // Calculate predictions
+    let dx_pred: Vec<f64> = idx_norm.iter().map(|&x| dx_poly.eval(x)).collect();
+    let dy_pred: Vec<f64> = idx_norm.iter().map(|&x| dy_poly.eval(x)).collect();
+    let time_pred: Vec<f64> = idx_norm.iter().map(|&x| time_poly.eval(x)).collect();
+
+    // Calculate R-squared for each
+    let dx_r_squared = calculate_r_squared(&dx_vals, &dx_pred);
+    let dy_r_squared = calculate_r_squared(&dy_vals, &dy_pred);
+    let time_r_squared = calculate_r_squared(&times, &time_pred);
+
+    Some(SegmentFit {
+        start_idx,
+        end_idx,
+        dx_poly,
+        dy_poly,
+        time_poly,
+        dx_r_squared,
+        dy_r_squared,
+        time_r_squared,
+    })
+}
+
+/// Check if an event is discrete (zero movement or poor fit)
+fn is_discrete_event(event: &MouseMoveEvent) -> bool {
+    event.dx == 0 && event.dy == 0
+}
+
+/// Build segments with adaptive sizing and R-squared optimization
 ///
 /// # Parameters
 ///
-/// - `events`: The full array of mouse movement events
-/// - `start`: Start index (inclusive) in the events array
-/// - `end`: End index (exclusive) in the events array
-/// - `min_pts`: Minimum points per segment (prevents over-segmentation)
-/// - `max_pts`: Maximum points before attempting to split
-/// - `px_scale`: Pixel scale factor for error measurement
-/// - `tol_px`: Error tolerance in pixels - segments with RMSE > tol_px are split
+/// - `events`: The mouse movement events to segment
+/// - `initial_size`: Initial segment size to try (e.g., 10)
+/// - `growth_factor`: Factor to multiply segment size when expanding (e.g., 1.5 or 2.0)
+/// - `min_r_squared`: Minimum acceptable R-squared (e.g., 0.8 or 0.9)
+/// - `balance_weight`: Weight for balancing length vs R-squared (0.0-1.0, higher favors length)
 ///
 /// # Returns
 ///
-/// A `SegmentNode` representing the root of the segment tree for this range.
-/// The tree is recursively built with children representing sub-segments when
-/// error exceeds tolerance.
-///
-/// # Algorithm
-///
-/// 1. Extract times and normalize to [-1, 1]
-/// 2. If n < 4, create a simple leaf node (no polynomial fit)
-/// 3. Fit cubic polynomials to dx and dy using SVD decomposition
-/// 4. Compute RMSE in pixel space
-/// 5. If RMSE > tolerance and n > min_pts, recursively split at midpoint
-/// 6. Return node with fitted polynomials and children
-pub fn build_segment_tree(events: &[MouseMoveEvent], start: usize, end: usize, min_pts: usize, max_pts: usize, px_scale: f64, tol_px: f64) -> SegmentNode {
-    let n = end - start;
-
-    // Extract time values and convert to seconds
-    let times: Vec<f64> = (start..end).map(|i| events[i].time_secs()).collect();
-
-    // Normalize times to [-1, 1] for better conditioning
-    let (t_norm, _t_offset, _t_scale) = normalize_times(&times);
-
-    // If we have fewer than 4 points, create a simple leaf
-    if n < 4 {
-        return SegmentNode {
-            start,
-            end,
-            coeff_x: Poly3::zero(),
-            coeff_y: Poly3::zero(),
-            rmse_px: 0.0,
-            children: Vec::new(),
-        };
+/// Vector of segments (Good or Discrete)
+pub fn build_segments(events: &[MouseMoveEvent], initial_size: usize, growth_factor: f64, min_r_squared: f64, balance_weight: f64) -> Vec<Segment> {
+    if events.is_empty() {
+        return Vec::new();
     }
 
-    // Extract dx and dy values
-    let dx_vals: Vec<f64> = (start..end).map(|i| events[i].dx as f64).collect();
-    let dy_vals: Vec<f64> = (start..end).map(|i| events[i].dy as f64).collect();
+    let mut segments = Vec::new();
+    let mut pos = 0;
 
-    // Fit cubic polynomials
-    let coeff_x = fit_cubic_poly(&t_norm, &dx_vals).unwrap_or_else(Poly3::zero);
-    let coeff_y = fit_cubic_poly(&t_norm, &dy_vals).unwrap_or_else(Poly3::zero);
+    while pos < events.len() {
+        // Try progressively larger segments
+        let mut best_fit: Option<SegmentFit> = None;
+        let mut best_score = f64::NEG_INFINITY;
+        let mut best_r_squared = f64::NEG_INFINITY;
+        let mut current_size = initial_size;
+        let mut fit_tolerance = 0;
+        let max_fit_tolerance_r_squared_up = 10;
+        let max_fit_tolerance_r_squared_down = 3;
 
-    // Compute RMSE
-    let rmse_px = compute_rmse_px(events, start, end, &t_norm, &coeff_x, &coeff_y, px_scale);
+        while pos + current_size <= events.len() {
+            let end = pos + current_size;
 
-    // Decide whether to split
-    let should_split = rmse_px > tol_px && n > min_pts && n > 2 * min_pts;
+            if let Some(fit) = analyze_segment(events, pos, end) {
+                // Calculate composite R-squared (average of dx, dy, time)
+                let avg_r_squared = (fit.dx_r_squared + fit.dy_r_squared + fit.time_r_squared) / 3.0;
 
-    let children = if should_split {
-        // Split at midpoint
-        let mid = start + n / 2;
+                // Only consider if all individual R-squared values are reasonable
+                if avg_r_squared >= min_r_squared && fit.time_r_squared >= min_r_squared * 0.7 {
+                    // Score balances R-squared and segment length
+                    // Higher balance_weight favors longer segments
+                    let length_score = (current_size as f64).ln();
+                    let score = balance_weight * length_score + (1.0 - balance_weight) * avg_r_squared;
 
-        // Recursively build children
-        let left = build_segment_tree(events, start, mid, min_pts, max_pts, px_scale, tol_px);
-        let right = build_segment_tree(events, mid, end, min_pts, max_pts, px_scale, tol_px);
+                    if score > best_score {
+                        best_score = score;
+                        best_fit = Some(fit);
+                        fit_tolerance = 0;
+                    }
+                } else {
+                    // Fit quality degraded
+                    if avg_r_squared > best_r_squared {
+                        fit_tolerance += 1;
+                        if fit_tolerance > max_fit_tolerance_r_squared_up {
+                            break;
+                        }
+                    } else {
+                        fit_tolerance += 1;
+                        if fit_tolerance > max_fit_tolerance_r_squared_down {
+                            break;
+                        }
+                    }
+                }
+                // Try larger segment
+                current_size = ((current_size as f64) * growth_factor).ceil() as usize;
 
-        vec![left, right]
-    } else {
-        Vec::new()
-    };
+                if avg_r_squared > best_r_squared {
+                    best_r_squared = avg_r_squared;
+                }
+            } else {
+                break;
+            }
+        }
 
-    SegmentNode { start, end, coeff_x, coeff_y, rmse_px, children }
+        if let Some(fit) = best_fit {
+            let segment_len = fit.end_idx - fit.start_idx;
+            segments.push(Segment::Good {
+                start_idx: fit.start_idx,
+                end_idx: fit.end_idx,
+                fit,
+            });
+            pos += segment_len;
+        } else {
+            // Couldn't fit well, mark as discrete
+            segments.push(Segment::Discrete { idx: pos });
+            pos += 1;
+        }
+    }
+
+    segments
 }
 
-/// Collect points for rendering at a specific view tolerance
-///
-/// Recursively traverses the segment tree and collects either:
-/// - Reduced point set using polynomial approximation (if node error is below tolerance)
-/// - Recursively collected points from children (if error exceeds tolerance)
+/// Collect visible event indices for rendering based on view parameters
 ///
 /// # Parameters
 ///
-/// - `node`: The segment tree node to process
-/// - `events`: The full array of mouse movement events
-/// - `px_scale`: Pixel scale factor for error measurement
-/// - `view_tol_px`: View-specific tolerance in pixels
-/// - `out`: Output vector to fill with (time_micros, dx, dy) tuples
+/// - `segments`: Pre-computed segments from build_segments
+/// - `events`: The mouse movement events
+/// - `render_width`: Width of rendering area in pixels
+/// - `render_height`: Height of rendering area in pixels
+/// - `x_range`: (x_min, x_max) time range to render
+/// - `y_range`: (y_min, y_max) value range to render
+/// - `tolerance`: Maximum events per pixel before hiding (e.g., 3.0)
+/// - `zoom_factor`: Zoom factor for caching (>1.0, e.g., 1.5)
 ///
-/// # Output Format
+/// # Returns
 ///
-/// Each tuple in `out` contains:
-/// - time_micros: Timestamp in microseconds (u64)
-/// - dx: Horizontal movement (f64)
-/// - dy: Vertical movement (f64)
-pub fn collect_for_view(node: &SegmentNode, events: &[MouseMoveEvent], px_scale: f64, view_tol_px: f64, out: &mut Vec<(u64, f64, f64)>) {
-    let n = node.end - node.start;
+/// Vector of event indices to render
+pub fn collect_visible_indices(
+    segments: &[Segment],
+    events: &[MouseMoveEvent],
+    render_width: f64,
+    render_height: f64,
+    x_range: (f64, f64),
+    y_range: (f64, f64),
+    tolerance: f64,
+    zoom_factor: f64, // Reserved for future caching optimization
+) -> Vec<usize> {
+    if events.is_empty() || segments.is_empty() {
+        return Vec::new();
+    }
 
-    // If we have children and error exceeds tolerance, recurse
-    if !node.children.is_empty() && node.rmse_px > view_tol_px {
-        // Recursively collect from children
-        for child in &node.children {
-            collect_for_view(child, events, px_scale, view_tol_px, out);
-        }
-    } else {
-        // Error is acceptable or leaf node: output reduced point set
-        // For small segments (< 10 points), output all points
-        // For larger segments with acceptable error, output key points only
-        if n <= 10 {
-            // Small segment: output all points
-            for i in node.start..node.end {
-                let e = &events[i];
-                out.push((e.time_micros(), e.dx as f64, e.dy as f64));
+    let mut visible_indices = Vec::new();
+    let mut seen_pixels = HashSet::new();
+
+    // Calculate pixel scales
+    let x_range_size = x_range.1 - x_range.0;
+    let y_range_size = y_range.1 - y_range.0;
+    let x_scale = render_width / (x_range_size).max(1e-10);
+    let y_scale = render_height / (y_range_size).max(1e-10);
+    let min_x_visible = x_range.0 - (x_range_size * ((zoom_factor - 1.0) / 2.0));
+    let max_x_visible = x_range.1 + (x_range_size * ((zoom_factor - 1.0) / 2.0));
+
+    // Helper: convert event to pixel coordinates
+    let to_pixel = |event: &MouseMoveEvent| -> (i32, i32) {
+        let px = ((event.time_secs() - x_range.0) * x_scale) as i32;
+        let py = ((-(event.dy as f64) - y_range.0) * y_scale) as i32;
+        (px, py)
+    };
+
+    // Helper: check if event is within visible time range
+    let is_visible = |event: &MouseMoveEvent| -> bool {
+        let time = event.time_secs();
+        time >= min_x_visible && time <= max_x_visible
+    };
+
+    // Process each segment
+    for segment in segments {
+        match segment {
+            Segment::Discrete { idx } => {
+                // Only include discrete events if they're visible
+                if *idx < events.len() && is_visible(&events[*idx]) {
+                    visible_indices.push(*idx);
+                }
             }
-        } else {
-            // Larger segment with acceptable error: output reduced set
-            // Include first, last, and sample points based on segment size
-            let sample_rate = (n / 10).max(2); // Sample every N points, at least every 2
+            Segment::Good { start_idx, end_idx, .. } => {
+                // For good segments, apply intelligent filtering
+                if *start_idx >= events.len() || *end_idx > events.len() {
+                    continue;
+                }
 
-            for i in (node.start..node.end).step_by(sample_rate) {
-                let e = &events[i];
-                out.push((e.time_micros(), e.dx as f64, e.dy as f64));
-            }
+                let segment_events = &events[*start_idx..*end_idx];
 
-            // Always include the last point if not already included
-            let last_idx = node.end - 1;
-            if (last_idx - node.start) % sample_rate != 0 {
-                let e = &events[last_idx];
-                out.push((e.time_micros(), e.dx as f64, e.dy as f64));
+                // Check if any event in this segment is visible
+                let has_visible = segment_events.iter().any(|e| is_visible(e));
+                if !has_visible {
+                    // Skip entire segment if no events are visible
+                    continue;
+                }
+
+                // Always include first and last to preserve continuity (if visible)
+                if is_visible(&events[*start_idx]) {
+                    visible_indices.push(*start_idx);
+                }
+                if end_idx - start_idx > 1 && is_visible(&events[*end_idx - 1]) {
+                    visible_indices.push(*end_idx - 1);
+                }
+
+                // For interior points, apply tolerance-based filtering
+                let mut pixel_counts: std::collections::HashMap<(i32, i32), Vec<usize>> = std::collections::HashMap::new();
+
+                for (local_idx, event) in segment_events.iter().enumerate() {
+                    // Only process visible events
+                    if !is_visible(event) {
+                        continue;
+                    }
+                    let global_idx = start_idx + local_idx;
+                    let pixel = to_pixel(event);
+                    pixel_counts.entry(pixel).or_insert_with(Vec::new).push(global_idx);
+                }
+
+                // Add events based on tolerance
+                for (pixel, indices) in pixel_counts.iter() {
+                    if seen_pixels.contains(pixel) {
+                        continue;
+                    }
+
+                    let count = indices.len() as f64;
+                    if count <= tolerance {
+                        // Include all events at this pixel
+                        for &idx in indices {
+                            // Don't duplicate first/last
+                            if idx != *start_idx && idx != *end_idx - 1 {
+                                visible_indices.push(idx);
+                            }
+                        }
+                    } else {
+                        // Too many events, sample them
+                        let sample_rate = (count / tolerance).ceil() as usize;
+                        for (i, &idx) in indices.iter().enumerate() {
+                            if i % sample_rate == 0 && idx != *start_idx && idx != *end_idx - 1 {
+                                visible_indices.push(idx);
+                            }
+                        }
+                    }
+
+                    seen_pixels.insert(*pixel);
+                }
             }
         }
     }
+
+    // Sort indices to maintain time order
+    visible_indices.sort_unstable();
+    visible_indices.dedup();
+
+    visible_indices
 }
 
 #[cfg(test)]
@@ -337,9 +473,21 @@ mod tests {
         for i in 0..n {
             let t_sec = i as u32;
             let t_usec = 0;
-            // Create a simple linear pattern: dx = i, dy = -i
-            let dx = i as i16;
-            let dy = -(i as i16);
+            // Linear pattern
+            let dx = (i * 10) as i16;
+            let dy = -(i as i16 * 5);
+            events.push(MouseMoveEvent::new(dx, dy, t_sec, t_usec));
+        }
+        events
+    }
+
+    fn make_test_events_with_zeros(n: usize) -> Vec<MouseMoveEvent> {
+        let mut events = Vec::new();
+        for i in 0..n {
+            let t_sec = i as u32;
+            let t_usec = 0;
+            // Every 5th event is zero
+            let (dx, dy) = if i % 5 == 0 { (0, 0) } else { ((i * 10) as i16, -(i as i16 * 5)) };
             events.push(MouseMoveEvent::new(dx, dy, t_sec, t_usec));
         }
         events
@@ -348,131 +496,103 @@ mod tests {
     #[test]
     fn test_poly3_eval() {
         let poly = Poly3 { a0: 1.0, a1: 2.0, a2: 3.0, a3: 4.0 };
-        // f(0) = 1
         assert_eq!(poly.eval(0.0), 1.0);
-        // f(1) = 1 + 2 + 3 + 4 = 10
         assert_eq!(poly.eval(1.0), 10.0);
-        // f(2) = 1 + 4 + 12 + 32 = 49
-        assert_eq!(poly.eval(2.0), 49.0);
     }
 
     #[test]
-    fn test_normalize_times() {
-        let times = vec![0.0, 1.0, 2.0, 3.0, 4.0];
-        let (normalized, offset, scale) = normalize_times(&times);
-
-        // Should be centered at 2.0 with range 4.0
-        // offset should be 2.0, scale should be 2.0/4.0 = 0.5
-        assert_eq!(offset, 2.0);
-        assert_eq!(scale, 0.5);
-
-        // Check normalized values map to [-1, 1]
-        assert!((normalized[0] - (-1.0)).abs() < 1e-10);
-        assert!((normalized[4] - 1.0).abs() < 1e-10);
-        assert!((normalized[2] - 0.0).abs() < 1e-10);
+    fn test_normalize_to_unit() {
+        let values = vec![0.0, 5.0, 10.0];
+        let (normalized, min_val, range) = normalize_to_unit(&values);
+        assert_eq!(min_val, 0.0);
+        assert_eq!(range, 10.0);
+        assert_eq!(normalized, vec![0.0, 0.5, 1.0]);
     }
 
     #[test]
-    fn test_fit_cubic_poly() {
-        // Test with perfectly cubic data: y = t^3
-        let t_norm = vec![-1.0, -0.5, 0.0, 0.5, 1.0];
-        let y: Vec<f64> = t_norm.iter().map(|&t| t * t * t).collect();
+    fn test_fit_cubic() {
+        let x = vec![0.0, 0.25, 0.5, 0.75, 1.0];
+        let y: Vec<f64> = x.iter().map(|&t| t * t * t).collect();
+        let poly = fit_cubic(&x, &y).unwrap();
 
-        let poly = fit_cubic_poly(&t_norm, &y).unwrap();
-
-        // Should get a0=0, a1=0, a2=0, a3=1 (approximately)
-        assert!((poly.a0).abs() < 1e-10);
-        assert!((poly.a1).abs() < 1e-10);
-        assert!((poly.a2).abs() < 1e-10);
-        assert!((poly.a3 - 1.0).abs() < 1e-10);
+        // Should approximate cubic function
+        assert!((poly.a0).abs() < 0.1);
+        assert!((poly.a3 - 1.0).abs() < 0.1);
     }
 
     #[test]
-    fn test_fit_cubic_poly_insufficient_points() {
-        let t_norm = vec![0.0, 1.0, 2.0];
-        let y = vec![0.0, 1.0, 4.0];
-
-        // Should return None with fewer than 4 points
-        assert!(fit_cubic_poly(&t_norm, &y).is_none());
+    fn test_calculate_r_squared() {
+        let y_actual = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let y_pred = vec![1.1, 1.9, 3.0, 4.1, 4.9];
+        let r2 = calculate_r_squared(&y_actual, &y_pred);
+        assert!(r2 > 0.95); // Should be very close to 1
     }
 
     #[test]
-    fn test_build_segment_tree_small() {
+    fn test_is_discrete_event() {
+        let zero_event = MouseMoveEvent::new(0, 0, 0, 0);
+        let normal_event = MouseMoveEvent::new(10, -5, 0, 0);
+
+        assert!(is_discrete_event(&zero_event));
+        assert!(!is_discrete_event(&normal_event));
+    }
+
+    #[test]
+    fn test_analyze_segment() {
         let events = make_test_events(10);
+        let fit = analyze_segment(&events, 0, 10);
 
-        let tree = build_segment_tree(&events, 0, events.len(), 5, 1000, 1.0, 1.0);
-
-        assert_eq!(tree.start, 0);
-        assert_eq!(tree.end, 10);
-        // With 10 points and linear data, the fit should be reasonable
-        assert!(tree.rmse_px >= 0.0);
+        assert!(fit.is_some());
+        let fit = fit.unwrap();
+        assert_eq!(fit.start_idx, 0);
+        assert_eq!(fit.end_idx, 10);
+        // Linear data should have high R-squared
+        assert!(fit.dx_r_squared > 0.9);
+        assert!(fit.dy_r_squared > 0.9);
+        assert!(fit.time_r_squared > 0.9);
     }
 
     #[test]
-    fn test_build_segment_tree_leaf() {
-        let events = make_test_events(3);
-
-        let tree = build_segment_tree(&events, 0, events.len(), 5, 1000, 1.0, 1.0);
-
-        // With only 3 points, should create a zero-coefficient leaf
-        assert_eq!(tree.start, 0);
-        assert_eq!(tree.end, 3);
-        assert_eq!(tree.children.len(), 0);
-        assert_eq!(tree.rmse_px, 0.0);
-    }
-
-    #[test]
-    fn test_collect_for_view() {
-        let events = make_test_events(10);
-
-        let tree = build_segment_tree(&events, 0, events.len(), 3, 1000, 1.0, 100.0);
-
-        let mut out = Vec::new();
-        collect_for_view(&tree, &events, 1.0, 100.0, &mut out);
-
-        // Should collect all 10 events
-        assert_eq!(out.len(), 10);
-
-        // Check first and last point
-        assert_eq!(out[0].1 as i16, 0); // dx of first event
-        assert_eq!(out[0].2 as i16, 0); // dy of first event
-        assert_eq!(out[9].1 as i16, 9); // dx of last event
-        assert_eq!(out[9].2 as i16, -9); // dy of last event
-    }
-
-    #[test]
-    fn test_collect_for_view_with_children() {
-        // Create enough events to trigger splitting
-        let events = make_test_events(100);
-
-        // Use a low tolerance to force splitting
-        let tree = build_segment_tree(&events, 0, events.len(), 5, 50, 1.0, 0.1);
-
-        let mut out = Vec::new();
-        collect_for_view(&tree, &events, 1.0, 0.1, &mut out);
-
-        // Should collect reduced set (with LOD, we get fewer points than original)
-        // The exact number depends on tree structure, but should be < 100 and > 0
-        assert!(out.len() > 0, "Should collect some points");
-        assert!(out.len() <= 100, "Should not exceed original count");
-
-        // With our sampling strategy, expect roughly 10-50% of original points
-        println!("LOD reduction: {} -> {} points ({:.1}% reduction)", events.len(), out.len(), 100.0 * (1.0 - out.len() as f64 / events.len() as f64));
-    }
-
-    #[test]
-    fn test_segment_node_structure() {
+    fn test_build_segments_simple() {
         let events = make_test_events(20);
+        let segments = build_segments(&events, 5, 2.0, 0.8, 0.5);
 
-        let tree = build_segment_tree(&events, 0, events.len(), 5, 10, 1.0, 0.5);
+        assert!(!segments.is_empty());
+        // Should have at least one good segment
+        let has_good = segments.iter().any(|s| matches!(s, Segment::Good { .. }));
+        assert!(has_good);
+    }
 
-        // Check that children are properly created if needed
-        if !tree.children.is_empty() {
-            // If we have children, check they cover the parent range
-            let child_start = tree.children.first().unwrap().start;
-            let child_end = tree.children.last().unwrap().end;
-            assert_eq!(child_start, tree.start);
-            assert_eq!(child_end, tree.end);
+    #[test]
+    fn test_collect_visible_indices() {
+        let events = make_test_events(100);
+        let segments = build_segments(&events, 10, 1.5, 0.85, 0.5);
+
+        let x_range = (0.0, 100.0);
+        let y_range = (-500.0, 1000.0);
+        let indices = collect_visible_indices(&segments, &events, 800.0, 600.0, x_range, y_range, 5.0, 1.5);
+
+        assert!(!indices.is_empty());
+        assert!(indices.len() <= events.len());
+        // Should maintain sorted order
+        for i in 1..indices.len() {
+            assert!(indices[i] > indices[i - 1]);
         }
+    }
+
+    #[test]
+    fn test_lod_cache_can_reuse() {
+        let cache = LodCache {
+            segments: Vec::new(),
+            zoom_factor: 1.0,
+            last_x_range: (0.0, 100.0),
+            last_y_range: (0.0, 100.0),
+        };
+
+        // Should reuse when zoomed in
+        assert!(cache.can_reuse((10.0, 50.0), (10.0, 50.0), 1.5));
+
+        // Should not reuse when zoomed out
+        assert!(!cache.can_reuse((0.0, 200.0), (0.0, 200.0), 1.0));
     }
 }

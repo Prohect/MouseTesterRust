@@ -1,9 +1,9 @@
-//! Integration test for advanced LOD algorithm using real test datasets
+//! Integration test for LOD algorithm using real test datasets
 //!
 //! This test loads CSV files from the examples/test directory and validates
-//! the advanced LOD algorithm with real mouse movement data.
+//! the LOD algorithm with real mouse movement data.
 
-use MouseTesterRust::lod_advanced::{build_segments, collect_visible_indices};
+use MouseTesterRust::lod::{build_segments, collect_visible_indices};
 use MouseTesterRust::mouse_event::MouseMoveEvent;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -235,7 +235,7 @@ fn test_lod_segment_quality_metrics() {
     // Real mouse data can have significant noise and jitter
     let segments = build_segments(&events, 20, 2.5, 0.5, 0.7);
 
-    use MouseTesterRust::lod_advanced::Segment;
+    use MouseTesterRust::lod::Segment;
     
     let mut good_count = 0;
     let mut discrete_count = 0;

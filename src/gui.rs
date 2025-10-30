@@ -1,6 +1,6 @@
 use crate::mouse_event::MouseMoveEvent;
-// Import the new advanced LOD module
-use crate::lod_advanced::{Segment, build_segments, collect_visible_indices};
+// Import the LOD module
+use crate::lod::{Segment, build_segments, collect_visible_indices};
 use eframe::egui;
 use std::sync::{
     Arc, Mutex,
@@ -23,14 +23,14 @@ pub struct MouseAnalyzerGui {
     last_f2_state: bool,                        // For edge detection
     target_device: Option<crate::TargetDevice>, // Store target device for restarts
 
-    // Advanced LOD state
-    advanced_lod_segments: Vec<Segment>,
+    // LOD state
+    lod_segments: Vec<Segment>,
     // Error points detected by regression analysis (indices of events with high residuals)
     // Filtered to only show points between min_x_visible and max_x_visible
-    advanced_lod_error_points: Vec<usize>,
-    advanced_lod_error_points_backup: Vec<usize>,
-    advanced_lod_last_events_len: usize,
-    advanced_lod_last_bounds: Option<PlotBounds>,
+    lod_error_points: Vec<usize>,
+    lod_error_points_backup: Vec<usize>,
+    lod_last_events_len: usize,
+    lod_last_bounds: Option<PlotBounds>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -55,18 +55,18 @@ impl MouseAnalyzerGui {
             last_f2_state: false,
             target_device,
 
-            // Advanced LOD initialization
-            advanced_lod_segments: Vec::new(),
-            advanced_lod_error_points: Vec::new(),
-            advanced_lod_error_points_backup: Vec::new(),
-            advanced_lod_last_events_len: 0,
-            advanced_lod_last_bounds: None,
+            // LOD initialization
+            lod_segments: Vec::new(),
+            lod_error_points: Vec::new(),
+            lod_error_points_backup: Vec::new(),
+            lod_last_events_len: 0,
+            lod_last_bounds: None,
         }
     }
 
     /// Check if plot bounds have changed significantly
     fn bounds_changed_significantly(&self, new_bounds: &PlotBounds) -> bool {
-        match self.advanced_lod_last_bounds {
+        match self.lod_last_bounds {
             None => true, // First time, always recalculate
             Some(old_bounds) => {
                 let x_range_old = (old_bounds.x_max - old_bounds.x_min).abs();
@@ -101,7 +101,7 @@ impl MouseAnalyzerGui {
         const K: f64 = 3.0;
         const SMALLEST_POSITIVE: f64 = 1e-8;
 
-        for segment in &self.advanced_lod_segments {
+        for segment in &self.lod_segments {
             if let Segment::Good { start_idx, end_idx, fit } = segment {
                 let n = end_idx - start_idx;
                 if n < 4 {
@@ -153,29 +153,29 @@ impl MouseAnalyzerGui {
         error_points
     }
 
-    /// NEW ADVANCED LOD: Apply the advanced LOD algorithm with regression-based segmentation
+    /// Apply the LOD algorithm with regression-based segmentation
     /// Returns indices into the events slice for rendering
-    fn apply_advanced_lod_indices(&mut self, events: &[MouseMoveEvent], visible_width: f64, visible_height: f64, plot_bounds: Option<&PlotBounds>) -> Vec<usize> {
+    fn apply_lod_indices(&mut self, events: &[MouseMoveEvent], visible_width: f64, visible_height: f64, plot_bounds: Option<&PlotBounds>) -> Vec<usize> {
         if events.is_empty() {
             return Vec::new();
         }
 
         // Check if we need to rebuild segments (events changed)
-        if events.len() != self.advanced_lod_last_events_len {
-            println!("Building advanced LOD segments for {} events...", events.len());
+        if events.len() != self.lod_last_events_len {
+            println!("Building LOD segments for {} events...", events.len());
             // Build segments with good parameters for real mouse data
             // - balance_weight: 0.091 (ln(len) is not and cant be normalized to 0.0 ~ 1.0)
-            self.advanced_lod_segments = build_segments(events, 10, 1.6, 0.98, 0.091);
-            self.advanced_lod_last_events_len = events.len();
-            println!("Created {} segments", self.advanced_lod_segments.len());
-            println!("Created {} discrete segments", self.advanced_lod_segments.iter().find(|&s| if let Segment::Discrete { idx: _ } = s {
+            self.lod_segments = build_segments(events, 10, 1.6, 0.98, 0.091);
+            self.lod_last_events_len = events.len();
+            println!("Created {} segments", self.lod_segments.len());
+            println!("Created {} discrete segments", self.lod_segments.iter().find(|&s| if let Segment::Discrete { idx: _ } = s {
                 true
             }else{false}).into_iter().count());
 
             // Calculate error points after building segments
             let all_error_points = self.calculate_error_points(events);
             println!("Detected {} error points", all_error_points.len());
-            self.advanced_lod_error_points_backup = all_error_points;
+            self.lod_error_points_backup = all_error_points;
         }
 
         // Get bounds or use full range
@@ -197,8 +197,8 @@ impl MouseAnalyzerGui {
         let max_x_visible = x_max + (x_range_size * ((zoom_factor - 1.0) / 2.0));
 
         // Filter error points to only those in visible range
-        self.advanced_lod_error_points = self.advanced_lod_error_points_backup.clone();
-        self.advanced_lod_error_points.retain(|&idx| {
+        self.lod_error_points = self.lod_error_points_backup.clone();
+        self.lod_error_points.retain(|&idx| {
             if idx < events.len() {
                 let time = events[idx].time_secs();
                 time >= min_x_visible && time <= max_x_visible
@@ -207,11 +207,11 @@ impl MouseAnalyzerGui {
             }
         });
 
-        // Collect visible indices with advanced LOD
+        // Collect visible indices with LOD
         // - tolerance: 3.0 (allow up to 3 events per pixel before hiding)
         // - zoom_factor: 1.2
         let indices = collect_visible_indices(
-            &self.advanced_lod_segments,
+            &self.lod_segments,
             events,
             visible_width,
             visible_height,
@@ -316,10 +316,10 @@ impl eframe::App for MouseAnalyzerGui {
                 self.captured_events = self.events.lock().unwrap().clone();
                 self.is_capturing = false;
 
-                // Clear Advanced LOD cache since we have new data
-                self.advanced_lod_segments.clear();
-                self.advanced_lod_last_events_len = 0;
-                self.advanced_lod_last_bounds = None;
+                // Clear LOD cache since we have new data
+                self.lod_segments.clear();
+                self.lod_last_events_len = 0;
+                self.lod_last_bounds = None;
             } else {
                 // Start a new capture
                 println!("F2 pressed: starting new capture...");
@@ -327,10 +327,10 @@ impl eframe::App for MouseAnalyzerGui {
                 self.events.lock().unwrap().clear();
                 self.captured_events.clear();
 
-                // Clear Advanced LOD cache
-                self.advanced_lod_segments.clear();
-                self.advanced_lod_last_events_len = 0;
-                self.advanced_lod_last_bounds = None;
+                // Clear LOD cache
+                self.lod_segments.clear();
+                self.lod_last_events_len = 0;
+                self.lod_last_bounds = None;
 
                 // Reset stop flag and restart capture
                 self.stop_flag.store(false, Ordering::SeqCst);
@@ -494,8 +494,8 @@ impl eframe::App for MouseAnalyzerGui {
                                     y_max: bounds.max()[1],
                                 };
 
-                                // Apply Advanced LOD
-                                let lod_indices = self.apply_advanced_lod_indices(&display_events, available_width as f64, available_height as f64, Some(&current_bounds));
+                                // Apply LOD
+                                let lod_indices = self.apply_lod_indices(&display_events, available_width as f64, available_height as f64, Some(&current_bounds));
 
                                 // Helper to safely map indices to plot points
                                 let map_to_points = |indices: &[usize], map_fn: fn(&MouseMoveEvent) -> [f64; 2]| indices.iter().filter_map(|&idx| if idx < display_events.len() { Some(map_fn(&display_events[idx])) } else { None }).collect::<PlotPoints>();
@@ -511,9 +511,9 @@ impl eframe::App for MouseAnalyzerGui {
                                 plot_ui.line(ndy_line);
 
                                 // Add error points visualization (shown as orange markers)
-                                if !self.advanced_lod_error_points.is_empty() {
+                                if !self.lod_error_points.is_empty() {
                                     // For dx error points
-                                    let dx_error_points = map_to_points(&self.advanced_lod_error_points, |e| [e.time_secs(), e.dx as f64]);
+                                    let dx_error_points = map_to_points(&self.lod_error_points, |e| [e.time_secs(), e.dx as f64]);
                                     let dx_error_markers = Points::new(dx_error_points)
                                         .color(egui::Color32::from_rgb(255, 165, 0))
                                         .radius(3.0)
@@ -521,7 +521,7 @@ impl eframe::App for MouseAnalyzerGui {
                                     plot_ui.points(dx_error_markers);
 
                                     // For -dy error points
-                                    let ndy_error_points = map_to_points(&self.advanced_lod_error_points, |e| [e.time_secs(), -(e.dy as f64)]);
+                                    let ndy_error_points = map_to_points(&self.lod_error_points, |e| [e.time_secs(), -(e.dy as f64)]);
                                     let ndy_error_markers = Points::new(ndy_error_points)
                                         .color(egui::Color32::from_rgb(255, 165, 0))
                                         .radius(3.0)
@@ -534,22 +534,22 @@ impl eframe::App for MouseAnalyzerGui {
 
                             // Update cached values
                             let (current_bounds, lod_indices) = plot_response.inner;
-                            self.advanced_lod_last_bounds = Some(current_bounds);
+                            self.lod_last_bounds = Some(current_bounds);
 
                             // Show LOD info if downsampling occurred
                             if lod_indices.len() < display_events.len() {
                                 // Calculate reduction percentage
                                 let reduction = 100.0 * (1.0 - lod_indices.len() as f64 / display_events.len() as f64);
-                                ui.label(format!("Advanced LOD: Showing {} of {} points ({:.1}% reduction)", lod_indices.len(), display_events.len(), reduction));
+                                ui.label(format!("LOD: Showing {} of {} points ({:.1}% reduction)", lod_indices.len(), display_events.len(), reduction));
                             } else {
                                 ui.label(format!("Showing all {} points (no LOD)", display_events.len()));
                             }
 
                             // Show error points info
-                            if !self.advanced_lod_error_points.is_empty() {
+                            if !self.lod_error_points.is_empty() {
                                 ui.colored_label(
                                     egui::Color32::from_rgb(255, 165, 0),
-                                    format!("⚠ {} error points detected (shown as orange markers)", self.advanced_lod_error_points.len())
+                                    format!("⚠ {} error points detected (shown as orange markers)", self.lod_error_points.len())
                                 );
                             }
                         });
@@ -665,7 +665,7 @@ mod tests {
         );
         
         // Build segments
-        gui.advanced_lod_segments = build_segments(&events, 10, 1.6, 0.8, 0.091);
+        gui.lod_segments = build_segments(&events, 10, 1.6, 0.8, 0.091);
         
         let error_points = gui.calculate_error_points(&events);
         
@@ -691,7 +691,7 @@ mod tests {
         );
         
         // Build segments
-        gui.advanced_lod_segments = build_segments(&events, 10, 1.6, 0.8, 0.091);
+        gui.lod_segments = build_segments(&events, 10, 1.6, 0.8, 0.091);
         
         let error_points = gui.calculate_error_points(&events);
         
@@ -710,10 +710,10 @@ mod tests {
         );
         
         // Build segments and calculate error points
-        gui.advanced_lod_segments = build_segments(&events, 10, 1.6, 0.8, 0.091);
-        gui.advanced_lod_error_points = gui.calculate_error_points(&events);
+        gui.lod_segments = build_segments(&events, 10, 1.6, 0.8, 0.091);
+        gui.lod_error_points = gui.calculate_error_points(&events);
         
-        let initial_error_count = gui.advanced_lod_error_points.len();
+        let initial_error_count = gui.lod_error_points.len();
         
         // Now apply LOD with limited visible range (should filter error points)
         let bounds = PlotBounds {
@@ -723,10 +723,10 @@ mod tests {
             y_max: 500.0,
         };
         
-        gui.apply_advanced_lod_indices(&events, 800.0, 600.0, Some(&bounds));
+        gui.apply_lod_indices(&events, 800.0, 600.0, Some(&bounds));
         
         // Error points should be filtered to visible range
-        for &idx in &gui.advanced_lod_error_points {
+        for &idx in &gui.lod_error_points {
             if idx < events.len() {
                 let time = events[idx].time_secs();
                 let x_range_size = bounds.x_max - bounds.x_min;
@@ -745,7 +745,7 @@ mod tests {
         println!(
             "Filtered error points from {} to {} based on visible range",
             initial_error_count,
-            gui.advanced_lod_error_points.len()
+            gui.lod_error_points.len()
         );
     }
 }
