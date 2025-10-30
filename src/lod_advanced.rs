@@ -351,7 +351,7 @@ pub fn collect_visible_indices(
     x_range: (f64, f64),
     y_range: (f64, f64),
     tolerance: f64,
-    _zoom_factor: f64, // Reserved for future caching optimization
+    zoom_factor: f64, // Reserved for future caching optimization
 ) -> Vec<usize> {
     if events.is_empty() || segments.is_empty() {
         return Vec::new();
@@ -365,8 +365,8 @@ pub fn collect_visible_indices(
     let y_range_size = y_range.1 - y_range.0;
     let x_scale = render_width / (x_range_size).max(1e-10);
     let y_scale = render_height / (y_range_size).max(1e-10);
-    let min_x_visible = x_range.0 - (x_range_size * ((_zoom_factor - 1.0) / 2.0));
-    let max_x_visible = x_range.1 + (x_range_size * ((_zoom_factor - 1.0) / 2.0));
+    let min_x_visible = x_range.0 - (x_range_size * ((zoom_factor - 1.0) / 2.0));
+    let max_x_visible = x_range.1 + (x_range_size * ((zoom_factor - 1.0) / 2.0));
 
     // Helper: convert event to pixel coordinates
     let to_pixel = |event: &MouseMoveEvent| -> (i32, i32) {
