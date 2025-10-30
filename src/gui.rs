@@ -629,6 +629,59 @@ impl eframe::App for MouseAnalyzerGui {
                                         .radius(4.0)
                                         .name("time errors"));
                                 }
+                                
+                                // Draw regression curves for Good segments
+                                // These show the polynomial fit used for LOD analysis
+                                for segment in &self.lod_segments {
+                                    if let Segment::Good { start_idx, end_idx, fit } = segment {
+                                        if *start_idx >= display_events.len() || *end_idx > display_events.len() {
+                                            continue;
+                                        }
+                                        
+                                        // Get time range for this segment
+                                        let start_time = display_events[*start_idx].time_secs();
+                                        let end_time = display_events[*end_idx - 1].time_secs();
+                                        
+                                        // Check if segment is visible
+                                        if end_time < current_bounds.x_min || start_time > current_bounds.x_max {
+                                            continue;
+                                        }
+                                        
+                                        // Sample the polynomial fit - use enough samples for smooth curves
+                                        let n_samples = 50;
+                                        let mut dx_curve_points = Vec::new();
+                                        let mut dy_curve_points = Vec::new();
+                                        
+                                        for i in 0..=n_samples {
+                                            let t_norm = i as f64 / n_samples as f64;
+                                            
+                                            // Interpolate actual time
+                                            let t_actual = start_time + (end_time - start_time) * t_norm;
+                                            
+                                            // Evaluate polynomials
+                                            let dx_fit = fit.dx_poly.eval(t_norm);
+                                            let dy_fit = fit.dy_poly.eval(t_norm);
+                                            
+                                            dx_curve_points.push([t_actual, dx_fit]);
+                                            dy_curve_points.push([t_actual, -dy_fit]);
+                                        }
+                                        
+                                        // Draw regression curves as dashed lines
+                                        let dx_regression = Line::new(PlotPoints::new(dx_curve_points))
+                                            .color(egui::Color32::from_rgba_premultiplied(255, 100, 100, 128))
+                                            .style(egui_plot::LineStyle::Dashed { length: 5.0 })
+                                            .width(1.5)
+                                            .name("dx regression");
+                                        let dy_regression = Line::new(PlotPoints::new(dy_curve_points))
+                                            .color(egui::Color32::from_rgba_premultiplied(100, 100, 255, 128))
+                                            .style(egui_plot::LineStyle::Dashed { length: 5.0 })
+                                            .width(1.5)
+                                            .name("-dy regression");
+                                        
+                                        plot_ui.line(dx_regression);
+                                        plot_ui.line(dy_regression);
+                                    }
+                                }
 
                                 (current_bounds, lod_indices)
                             });
