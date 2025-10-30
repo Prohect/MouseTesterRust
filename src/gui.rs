@@ -1,6 +1,6 @@
 use crate::mouse_event::MouseMoveEvent;
 // Import the LOD module
-use crate::lod::{Segment, build_segments, collect_visible_indices};
+use crate::lod::{Segment, build_segments, collect_visible_indices, LodCache};
 use eframe::egui;
 use std::sync::{
     Arc, Mutex,
@@ -31,6 +31,8 @@ pub struct MouseAnalyzerGui {
     lod_error_points_backup: Vec<usize>,
     lod_last_events_len: usize,
     lod_last_bounds: Option<PlotBounds>,
+    // Cache for visible indices
+    lod_cache: Option<LodCache>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -61,6 +63,7 @@ impl MouseAnalyzerGui {
             lod_error_points_backup: Vec::new(),
             lod_last_events_len: 0,
             lod_last_bounds: None,
+            lod_cache: None,
         }
     }
 
@@ -176,6 +179,9 @@ impl MouseAnalyzerGui {
             let all_error_points = self.calculate_error_points(events);
             println!("Detected {} error points", all_error_points.len());
             self.lod_error_points_backup = all_error_points;
+            
+            // Clear cache since segments changed
+            self.lod_cache = None;
         }
 
         // Get bounds or use full range
@@ -190,13 +196,41 @@ impl MouseAnalyzerGui {
             (x_min, x_max, y_min, y_max)
         };
 
-        // Calculate visible range with zoom factor
+        // Calculate visible range with zoom factor for pre-fetching
         let x_range_size = x_max - x_min;
         let zoom_factor = 1.2;
+        let tolerance = 3.0;
+        
+        // Check if we can reuse cached results
+        let indices = if let Some(ref cache) = self.lod_cache {
+            if cache.can_reuse((x_min, x_max), (y_min, y_max), tolerance, zoom_factor) {
+                // Filter cached indices to current view
+                let filtered: Vec<usize> = cache.visible_indices.iter()
+                    .filter(|&&idx| {
+                        if idx < events.len() {
+                            let time = events[idx].time_secs();
+                            time >= x_min && time <= x_max
+                        } else {
+                            false
+                        }
+                    })
+                    .copied()
+                    .collect();
+                println!("Using cached LOD results: {} -> {} indices", cache.visible_indices.len(), filtered.len());
+                filtered
+            } else {
+                // Cache invalid, recompute
+                self.compute_and_cache_indices(events, visible_width, visible_height, x_min, x_max, y_min, y_max, tolerance, zoom_factor)
+            }
+        } else {
+            // No cache, compute fresh
+            self.compute_and_cache_indices(events, visible_width, visible_height, x_min, x_max, y_min, y_max, tolerance, zoom_factor)
+        };
+        
+        // Filter error points to only those in visible range (with zoom factor extension)
         let min_x_visible = x_min - (x_range_size * ((zoom_factor - 1.0) / 2.0));
         let max_x_visible = x_max + (x_range_size * ((zoom_factor - 1.0) / 2.0));
-
-        // Filter error points to only those in visible range
+        
         self.lod_error_points = self.lod_error_points_backup.clone();
         self.lod_error_points.retain(|&idx| {
             if idx < events.len() {
@@ -207,21 +241,61 @@ impl MouseAnalyzerGui {
             }
         });
 
-        // Collect visible indices with LOD
-        // - tolerance: 3.0 (allow up to 3 events per pixel before hiding)
-        // - zoom_factor: 1.2
+        indices
+    }
+    
+    /// Compute visible indices and cache the result
+    fn compute_and_cache_indices(
+        &mut self,
+        events: &[MouseMoveEvent],
+        visible_width: f64,
+        visible_height: f64,
+        x_min: f64,
+        x_max: f64,
+        y_min: f64,
+        y_max: f64,
+        tolerance: f64,
+        zoom_factor: f64,
+    ) -> Vec<usize> {
+        // Collect visible indices with LOD using extended range for caching
+        let x_range_size = x_max - x_min;
+        let cache_x_min = x_min - (x_range_size * ((zoom_factor - 1.0) / 2.0));
+        let cache_x_max = x_max + (x_range_size * ((zoom_factor - 1.0) / 2.0));
+        
         let indices = collect_visible_indices(
             &self.lod_segments,
             events,
             visible_width,
             visible_height,
-            (x_min, x_max),
+            (cache_x_min, cache_x_max),
             (y_min, y_max),
-            3.0, // tolerance
-            1.2, // zoom_factor
+            tolerance,
+            zoom_factor,
         );
-
-        indices
+        
+        // Cache the result
+        self.lod_cache = Some(LodCache {
+            segments: self.lod_segments.clone(),
+            visible_indices: indices.clone(),
+            zoom_factor,
+            last_x_range: (cache_x_min, cache_x_max),
+            last_y_range: (y_min, y_max),
+            last_tolerance: tolerance,
+        });
+        
+        println!("Computed and cached {} LOD indices", indices.len());
+        
+        // Filter to current view
+        indices.into_iter()
+            .filter(|&idx| {
+                if idx < events.len() {
+                    let time = events[idx].time_secs();
+                    time >= x_min && time <= x_max
+                } else {
+                    false
+                }
+            })
+            .collect()
     }
 
     fn calculate_stats(&self, events: &[MouseMoveEvent]) -> Stats {
@@ -320,6 +394,7 @@ impl eframe::App for MouseAnalyzerGui {
                 self.lod_segments.clear();
                 self.lod_last_events_len = 0;
                 self.lod_last_bounds = None;
+                self.lod_cache = None;
             } else {
                 // Start a new capture
                 println!("F2 pressed: starting new capture...");
@@ -331,6 +406,7 @@ impl eframe::App for MouseAnalyzerGui {
                 self.lod_segments.clear();
                 self.lod_last_events_len = 0;
                 self.lod_last_bounds = None;
+                self.lod_cache = None;
 
                 // Reset stop flag and restart capture
                 self.stop_flag.store(false, Ordering::SeqCst);

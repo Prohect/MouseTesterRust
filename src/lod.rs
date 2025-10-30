@@ -96,20 +96,23 @@ pub enum Segment {
 #[derive(Debug, Clone)]
 pub struct LodCache {
     pub segments: Vec<Segment>,
+    pub visible_indices: Vec<usize>,
     pub zoom_factor: f64,
     pub last_x_range: (f64, f64),
     pub last_y_range: (f64, f64),
+    pub last_tolerance: f64,
 }
 
 impl LodCache {
     /// Check if cached result can be reused for given view
-    pub fn can_reuse(&self, x_range: (f64, f64), y_range: (f64, f64), zoom_factor: f64) -> bool {
+    pub fn can_reuse(&self, x_range: (f64, f64), y_range: (f64, f64), tolerance: f64, zoom_factor: f64) -> bool {
         // Cache is valid if new view is within cached view (zoomed in)
         let x_within = x_range.0 >= self.last_x_range.0 && x_range.1 <= self.last_x_range.1;
         let y_within = y_range.0 >= self.last_y_range.0 && y_range.1 <= self.last_y_range.1;
         let zoom_ok = zoom_factor >= self.zoom_factor * ZOOM_TOLERANCE_FACTOR;
+        let tolerance_ok = (tolerance - self.last_tolerance).abs() < 0.01;
 
-        x_within && y_within && zoom_ok
+        x_within && y_within && zoom_ok && tolerance_ok
     }
 }
 
@@ -338,7 +341,9 @@ pub fn build_segments(events: &[MouseMoveEvent], initial_size: usize, growth_fac
 /// - `x_range`: (x_min, x_max) time range to render
 /// - `y_range`: (y_min, y_max) value range to render
 /// - `tolerance`: Maximum events per pixel before hiding (e.g., 3.0)
-/// - `zoom_factor`: Zoom factor for caching (>1.0, e.g., 1.5)
+/// - `zoom_factor`: Zoom factor for caching optimization (>1.0, e.g., 1.5)
+///   - Values > 1.0 will pre-fetch a larger area for smoother zoom/pan operations
+///   - The visible range is extended by (zoom_factor - 1.0) / 2 on each side
 ///
 /// # Returns
 ///
@@ -351,7 +356,7 @@ pub fn collect_visible_indices(
     x_range: (f64, f64),
     y_range: (f64, f64),
     tolerance: f64,
-    zoom_factor: f64, // Reserved for future caching optimization
+    zoom_factor: f64,
 ) -> Vec<usize> {
     if events.is_empty() || segments.is_empty() {
         return Vec::new();
@@ -365,8 +370,11 @@ pub fn collect_visible_indices(
     let y_range_size = y_range.1 - y_range.0;
     let x_scale = render_width / (x_range_size).max(1e-10);
     let y_scale = render_height / (y_range_size).max(1e-10);
-    let min_x_visible = x_range.0 - (x_range_size * ((zoom_factor - 1.0) / 2.0));
-    let max_x_visible = x_range.1 + (x_range_size * ((zoom_factor - 1.0) / 2.0));
+    
+    // Note: zoom_factor is provided but the x_range should already be extended by the caller
+    // if they want to cache a larger area. We use x_range directly for visibility checks.
+    let min_x_visible = x_range.0;
+    let max_x_visible = x_range.1;
 
     // Helper: convert event to pixel coordinates
     let to_pixel = |event: &MouseMoveEvent| -> (i32, i32) {
@@ -584,15 +592,20 @@ mod tests {
     fn test_lod_cache_can_reuse() {
         let cache = LodCache {
             segments: Vec::new(),
+            visible_indices: Vec::new(),
             zoom_factor: 1.0,
             last_x_range: (0.0, 100.0),
             last_y_range: (0.0, 100.0),
+            last_tolerance: 3.0,
         };
 
         // Should reuse when zoomed in
-        assert!(cache.can_reuse((10.0, 50.0), (10.0, 50.0), 1.5));
+        assert!(cache.can_reuse((10.0, 50.0), (10.0, 50.0), 3.0, 1.5));
 
         // Should not reuse when zoomed out
-        assert!(!cache.can_reuse((0.0, 200.0), (0.0, 200.0), 1.0));
+        assert!(!cache.can_reuse((0.0, 200.0), (0.0, 200.0), 3.0, 1.0));
+        
+        // Should not reuse when tolerance changes significantly
+        assert!(!cache.can_reuse((10.0, 50.0), (10.0, 50.0), 5.0, 1.5));
     }
 }
