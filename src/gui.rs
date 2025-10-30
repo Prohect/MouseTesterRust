@@ -25,10 +25,10 @@ pub struct MouseAnalyzerGui {
 
     // LOD state
     lod_segments: Vec<Segment>,
-    // Error points detected by regression analysis (indices of events with high residuals)
-    // Filtered to only show points between min_x_visible and max_x_visible
-    lod_error_points: Vec<usize>,
-    lod_error_points_backup: Vec<usize>,
+    // Error points detected by regression analysis, categorized by type
+    lod_dx_errors: Vec<usize>,      // Errors in dx (red)
+    lod_dy_errors: Vec<usize>,      // Errors in dy (blue/cyan)
+    lod_time_errors: Vec<usize>,    // Timing errors (yellow)
     lod_last_events_len: usize,
     lod_last_bounds: Option<PlotBounds>,
     // Cache for visible indices
@@ -59,8 +59,9 @@ impl MouseAnalyzerGui {
 
             // LOD initialization
             lod_segments: Vec::new(),
-            lod_error_points: Vec::new(),
-            lod_error_points_backup: Vec::new(),
+            lod_dx_errors: Vec::new(),
+            lod_dy_errors: Vec::new(),
+            lod_time_errors: Vec::new(),
             lod_last_events_len: 0,
             lod_last_bounds: None,
             lod_cache: None,
@@ -97,10 +98,13 @@ impl MouseAnalyzerGui {
         }
     }
 
-    /// Calculate error points based on regression residuals
+    /// Calculate error points based on regression residuals, categorized by error type
     /// Error is detected when: abs(y0-y1)/max(smallestPositive,abs(y1)) > (sqrt(1-r2)/k)
-    fn calculate_error_points(&self, events: &[MouseMoveEvent]) -> Vec<usize> {
-        let mut error_points = Vec::new();
+    /// Returns (dx_errors, dy_errors, time_errors)
+    fn calculate_error_points(&self, events: &[MouseMoveEvent]) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
+        let mut dx_errors = Vec::new();
+        let mut dy_errors = Vec::new();
+        let mut time_errors = Vec::new();
         const K: f64 = 3.0;
         const SMALLEST_POSITIVE: f64 = 1e-8;
 
@@ -145,15 +149,21 @@ impl MouseAnalyzerGui {
                     let dy_error = (dy_actual - dy_pred).abs() / dy_pred.abs().max(SMALLEST_POSITIVE);
                     let time_error = (time_actual - time_pred).abs() / time_pred.abs().max(SMALLEST_POSITIVE);
 
-                    // Mark as error if any dimension exceeds threshold
-                    if dx_error > dx_threshold || dy_error > dy_threshold || time_error > time_threshold {
-                        error_points.push(global_idx);
+                    // Categorize errors by type
+                    if dx_error > dx_threshold {
+                        dx_errors.push(global_idx);
+                    }
+                    if dy_error > dy_threshold {
+                        dy_errors.push(global_idx);
+                    }
+                    if time_error > time_threshold {
+                        time_errors.push(global_idx);
                     }
                 }
             }
         }
 
-        error_points
+        (dx_errors, dy_errors, time_errors)
     }
 
     /// Apply the LOD algorithm with regression-based segmentation
@@ -175,10 +185,12 @@ impl MouseAnalyzerGui {
                 true
             }else{false}).into_iter().count());
 
-            // Calculate error points after building segments
-            let all_error_points = self.calculate_error_points(events);
-            println!("Detected {} error points", all_error_points.len());
-            self.lod_error_points_backup = all_error_points;
+            // Calculate error points after building segments (categorized by type)
+            let (dx_errs, dy_errs, time_errs) = self.calculate_error_points(events);
+            println!("Detected errors: {} dx, {} dy, {} time", dx_errs.len(), dy_errs.len(), time_errs.len());
+            self.lod_dx_errors = dx_errs;
+            self.lod_dy_errors = dy_errs;
+            self.lod_time_errors = time_errs;
             
             // Clear cache since segments changed
             self.lod_cache = None;
@@ -226,20 +238,6 @@ impl MouseAnalyzerGui {
             // No cache, compute fresh
             self.compute_and_cache_indices(events, visible_width, visible_height, x_min, x_max, y_min, y_max, tolerance, zoom_factor)
         };
-        
-        // Filter error points to only those in visible range (with zoom factor extension)
-        let min_x_visible = x_min - (x_range_size * ((zoom_factor - 1.0) / 2.0));
-        let max_x_visible = x_max + (x_range_size * ((zoom_factor - 1.0) / 2.0));
-        
-        self.lod_error_points = self.lod_error_points_backup.clone();
-        self.lod_error_points.retain(|&idx| {
-            if idx < events.len() {
-                let time = events[idx].time_secs();
-                time >= min_x_visible && time <= max_x_visible
-            } else {
-                false
-            }
-        });
 
         indices
     }
@@ -586,23 +584,50 @@ impl eframe::App for MouseAnalyzerGui {
                                 plot_ui.line(dx_line);
                                 plot_ui.line(ndy_line);
 
-                                // Add error points visualization (shown as orange markers)
-                                if !self.lod_error_points.is_empty() {
-                                    // For dx error points
-                                    let dx_error_points = map_to_points(&self.lod_error_points, |e| [e.time_secs(), e.dx as f64]);
-                                    let dx_error_markers = Points::new(dx_error_points)
-                                        .color(egui::Color32::from_rgb(255, 165, 0))
-                                        .radius(3.0)
-                                        .name("dx errors");
-                                    plot_ui.points(dx_error_markers);
-
-                                    // For -dy error points
-                                    let ndy_error_points = map_to_points(&self.lod_error_points, |e| [e.time_secs(), -(e.dy as f64)]);
-                                    let ndy_error_markers = Points::new(ndy_error_points)
-                                        .color(egui::Color32::from_rgb(255, 165, 0))
-                                        .radius(3.0)
-                                        .name("-dy errors");
-                                    plot_ui.points(ndy_error_markers);
+                                // Add error points visualization with different colors for each type
+                                // dx errors - shown in dark red
+                                if !self.lod_dx_errors.is_empty() {
+                                    let dx_dx_errors = map_to_points(&self.lod_dx_errors, |e| [e.time_secs(), e.dx as f64]);
+                                    let dx_dy_errors = map_to_points(&self.lod_dx_errors, |e| [e.time_secs(), -(e.dy as f64)]);
+                                    
+                                    plot_ui.points(Points::new(dx_dx_errors)
+                                        .color(egui::Color32::from_rgb(200, 0, 0))
+                                        .radius(4.0)
+                                        .name("dx errors"));
+                                    plot_ui.points(Points::new(dx_dy_errors)
+                                        .color(egui::Color32::from_rgb(200, 0, 0))
+                                        .radius(4.0)
+                                        .name("dx errors (-dy view)"));
+                                }
+                                
+                                // dy errors - shown in cyan
+                                if !self.lod_dy_errors.is_empty() {
+                                    let dy_dx_errors = map_to_points(&self.lod_dy_errors, |e| [e.time_secs(), e.dx as f64]);
+                                    let dy_dy_errors = map_to_points(&self.lod_dy_errors, |e| [e.time_secs(), -(e.dy as f64)]);
+                                    
+                                    plot_ui.points(Points::new(dy_dx_errors)
+                                        .color(egui::Color32::from_rgb(0, 200, 200))
+                                        .radius(4.0)
+                                        .name("dy errors (dx view)"));
+                                    plot_ui.points(Points::new(dy_dy_errors)
+                                        .color(egui::Color32::from_rgb(0, 200, 200))
+                                        .radius(4.0)
+                                        .name("dy errors"));
+                                }
+                                
+                                // time errors - shown in yellow
+                                if !self.lod_time_errors.is_empty() {
+                                    let time_dx_errors = map_to_points(&self.lod_time_errors, |e| [e.time_secs(), e.dx as f64]);
+                                    let time_dy_errors = map_to_points(&self.lod_time_errors, |e| [e.time_secs(), -(e.dy as f64)]);
+                                    
+                                    plot_ui.points(Points::new(time_dx_errors)
+                                        .color(egui::Color32::from_rgb(255, 220, 0))
+                                        .radius(4.0)
+                                        .name("time errors (dx view)"));
+                                    plot_ui.points(Points::new(time_dy_errors)
+                                        .color(egui::Color32::from_rgb(255, 220, 0))
+                                        .radius(4.0)
+                                        .name("time errors"));
                                 }
 
                                 (current_bounds, lod_indices)
@@ -621,12 +646,30 @@ impl eframe::App for MouseAnalyzerGui {
                                 ui.label(format!("Showing all {} points (no LOD)", display_events.len()));
                             }
 
-                            // Show error points info
-                            if !self.lod_error_points.is_empty() {
-                                ui.colored_label(
-                                    egui::Color32::from_rgb(255, 165, 0),
-                                    format!("⚠ {} error points detected (shown as orange markers)", self.lod_error_points.len())
-                                );
+                            // Show error points info with color coding
+                            let total_errors = self.lod_dx_errors.len() + self.lod_dy_errors.len() + self.lod_time_errors.len();
+                            if total_errors > 0 {
+                                ui.horizontal(|ui| {
+                                    ui.label("⚠ Errors detected:");
+                                    if !self.lod_dx_errors.is_empty() {
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(200, 0, 0),
+                                            format!("{} dx", self.lod_dx_errors.len())
+                                        );
+                                    }
+                                    if !self.lod_dy_errors.is_empty() {
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(0, 200, 200),
+                                            format!("{} dy", self.lod_dy_errors.len())
+                                        );
+                                    }
+                                    if !self.lod_time_errors.is_empty() {
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(255, 220, 0),
+                                            format!("{} time", self.lod_time_errors.len())
+                                        );
+                                    }
+                                });
                             }
                         });
                         ui.add_space(10.0);
@@ -727,8 +770,8 @@ mod tests {
             None
         );
         
-        let error_points = gui.calculate_error_points(&events);
-        assert_eq!(error_points.len(), 0, "Should have no error points with empty segments");
+        let (dx_errs, dy_errs, time_errs) = gui.calculate_error_points(&events);
+        assert_eq!(dx_errs.len() + dy_errs.len() + time_errs.len(), 0, "Should have no error points with empty segments");
     }
 
     #[test]
@@ -743,12 +786,17 @@ mod tests {
         // Build segments
         gui.lod_segments = build_segments(&events, 10, 1.6, 0.8, 0.091);
         
-        let error_points = gui.calculate_error_points(&events);
+        let (dx_errs, dy_errs, time_errs) = gui.calculate_error_points(&events);
+        let total_errors = dx_errs.len() + dy_errs.len() + time_errs.len();
         
         // With linear data, we should have very few or no error points
         // (since the data fits well to polynomial regression)
-        assert!(error_points.len() <= events.len(), "Error points should not exceed total events");
-        println!("Detected {} error points out of {} events", error_points.len(), events.len());
+        // Note: each individual error vector should not exceed total events
+        assert!(dx_errs.len() <= events.len(), "dx errors should not exceed total events");
+        assert!(dy_errs.len() <= events.len(), "dy errors should not exceed total events");
+        assert!(time_errs.len() <= events.len(), "time errors should not exceed total events");
+        println!("Detected {} error points out of {} events (dx:{}, dy:{}, time:{})", 
+            total_errors, events.len(), dx_errs.len(), dy_errs.len(), time_errs.len());
     }
 
     #[test]
@@ -769,59 +817,12 @@ mod tests {
         // Build segments
         gui.lod_segments = build_segments(&events, 10, 1.6, 0.8, 0.091);
         
-        let error_points = gui.calculate_error_points(&events);
+        let (dx_errs, dy_errs, time_errs) = gui.calculate_error_points(&events);
+        let total_errors = dx_errs.len() + dy_errs.len() + time_errs.len();
         
         // Should detect some error points due to outliers
-        println!("Detected {} error points with outliers", error_points.len());
-        assert!(!error_points.is_empty(), "Should detect error points with outliers");
-    }
-
-    #[test]
-    fn test_error_points_filtered_by_visible_range() {
-        let events = create_test_events(100);
-        let mut gui = MouseAnalyzerGui::new(
-            Arc::new(Mutex::new(Vec::new())),
-            Arc::new(AtomicBool::new(false)),
-            None
-        );
-        
-        // Build segments and calculate error points
-        gui.lod_segments = build_segments(&events, 10, 1.6, 0.8, 0.091);
-        gui.lod_error_points = gui.calculate_error_points(&events);
-        
-        let initial_error_count = gui.lod_error_points.len();
-        
-        // Now apply LOD with limited visible range (should filter error points)
-        let bounds = PlotBounds {
-            x_min: 10.0,
-            x_max: 30.0,
-            y_min: -500.0,
-            y_max: 500.0,
-        };
-        
-        gui.apply_lod_indices(&events, 800.0, 600.0, Some(&bounds));
-        
-        // Error points should be filtered to visible range
-        for &idx in &gui.lod_error_points {
-            if idx < events.len() {
-                let time = events[idx].time_secs();
-                let x_range_size = bounds.x_max - bounds.x_min;
-                let zoom_factor = 1.2;
-                let min_x_visible = bounds.x_min - (x_range_size * ((zoom_factor - 1.0) / 2.0));
-                let max_x_visible = bounds.x_max + (x_range_size * ((zoom_factor - 1.0) / 2.0));
-                
-                assert!(
-                    time >= min_x_visible && time <= max_x_visible,
-                    "Error point at index {} with time {} should be within visible range [{}, {}]",
-                    idx, time, min_x_visible, max_x_visible
-                );
-            }
-        }
-        
-        println!(
-            "Filtered error points from {} to {} based on visible range",
-            initial_error_count,
-            gui.lod_error_points.len()
-        );
+        println!("Detected {} error points with outliers (dx:{}, dy:{}, time:{})", 
+            total_errors, dx_errs.len(), dy_errs.len(), time_errs.len());
+        assert!(total_errors > 0, "Should detect error points with outliers");
     }
 }
