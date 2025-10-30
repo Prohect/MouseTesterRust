@@ -36,7 +36,7 @@ fn load_csv_events(path: &Path) -> Result<Vec<MouseMoveEvent>, Box<dyn std::erro
         let ts_sec = time.floor() as u32;
         let ts_usec = ((time - time.floor()) * 1_000_000.0) as u32;
 
-        events.push(MouseMoveEvent::new(dx, dy, ts_sec, ts_usec));
+        events.push(MouseMoveEvent::new( dx,dy,ts_sec, ts_usec,false,0,[false,false,false,false,false],0,0));
     }
 
     Ok(events)

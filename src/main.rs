@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use byteorder::{LittleEndian, ReadBytesExt};
 use plotters::prelude::*;
 use std::{
@@ -8,8 +8,8 @@ use std::{
     process::{Command, Stdio},
     str::FromStr,
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering as AtomicOrdering},
+        atomic::{AtomicBool, Ordering as AtomicOrdering}, Arc,
+        Mutex,
     },
     thread,
     time::Duration,
@@ -386,7 +386,7 @@ pub fn run_capture(events_arc: Arc<Mutex<Vec<MouseMoveEvent>>>, stop_flag: Arc<A
                                 if let Some(event) = mouse_event::parser::parse_with_report_id(payload, &rec_hdr) {
                                     let mut events = events_arc.lock().unwrap();
                                     // Create event with relative timestamp
-                                    events.push(MouseMoveEvent::new(event.dx, event.dy, rel_sec, rel_usec));
+                                    events.push(MouseMoveEvent::alter_time(event, rel_sec, rel_usec));
                                 }
                             }
                         } else {
@@ -418,7 +418,7 @@ pub fn run_capture(events_arc: Arc<Mutex<Vec<MouseMoveEvent>>>, stop_flag: Arc<A
                                 if let Some(event) = mouse_event::parser::parse_without_report_id(payload, &rec_hdr) {
                                     let mut events = events_arc.lock().unwrap();
                                     // Create event with relative timestamp
-                                    events.push(MouseMoveEvent::new(event.dx, event.dy, rel_sec, rel_usec));
+                                    events.push(MouseMoveEvent::alter_time(event, rel_sec, rel_usec));
                                 }
                             }
                         } else {

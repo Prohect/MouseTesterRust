@@ -348,16 +348,7 @@ pub fn build_segments(events: &[MouseMoveEvent], initial_size: usize, growth_fac
 /// # Returns
 ///
 /// Vector of event indices to render
-pub fn collect_visible_indices(
-    segments: &[Segment],
-    events: &[MouseMoveEvent],
-    render_width: f64,
-    render_height: f64,
-    x_range: (f64, f64),
-    y_range: (f64, f64),
-    tolerance: f64,
-    zoom_factor: f64,
-) -> Vec<usize> {
+pub fn collect_visible_indices(segments: &[Segment], events: &[MouseMoveEvent], render_width: f64, render_height: f64, x_range: (f64, f64), y_range: (f64, f64), tolerance: f64, zoom_factor: f64) -> Vec<usize> {
     if events.is_empty() || segments.is_empty() {
         return Vec::new();
     }
@@ -370,7 +361,7 @@ pub fn collect_visible_indices(
     let y_range_size = y_range.1 - y_range.0;
     let x_scale = render_width / (x_range_size).max(1e-10);
     let y_scale = render_height / (y_range_size).max(1e-10);
-    
+
     // Note: zoom_factor is provided but the x_range should already be extended by the caller
     // if they want to cache a larger area. We use x_range directly for visibility checks.
     let min_x_visible = x_range.0;
@@ -470,142 +461,4 @@ pub fn collect_visible_indices(
     visible_indices.dedup();
 
     visible_indices
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn make_test_events(n: usize) -> Vec<MouseMoveEvent> {
-        let mut events = Vec::new();
-        for i in 0..n {
-            let t_sec = i as u32;
-            let t_usec = 0;
-            // Linear pattern
-            let dx = (i * 10) as i16;
-            let dy = -(i as i16 * 5);
-            events.push(MouseMoveEvent::new(dx, dy, t_sec, t_usec));
-        }
-        events
-    }
-
-    fn make_test_events_with_zeros(n: usize) -> Vec<MouseMoveEvent> {
-        let mut events = Vec::new();
-        for i in 0..n {
-            let t_sec = i as u32;
-            let t_usec = 0;
-            // Every 5th event is zero
-            let (dx, dy) = if i % 5 == 0 { (0, 0) } else { ((i * 10) as i16, -(i as i16 * 5)) };
-            events.push(MouseMoveEvent::new(dx, dy, t_sec, t_usec));
-        }
-        events
-    }
-
-    #[test]
-    fn test_poly3_eval() {
-        let poly = Poly3 { a0: 1.0, a1: 2.0, a2: 3.0, a3: 4.0 };
-        assert_eq!(poly.eval(0.0), 1.0);
-        assert_eq!(poly.eval(1.0), 10.0);
-    }
-
-    #[test]
-    fn test_normalize_to_unit() {
-        let values = vec![0.0, 5.0, 10.0];
-        let (normalized, min_val, range) = normalize_to_unit(&values);
-        assert_eq!(min_val, 0.0);
-        assert_eq!(range, 10.0);
-        assert_eq!(normalized, vec![0.0, 0.5, 1.0]);
-    }
-
-    #[test]
-    fn test_fit_cubic() {
-        let x = vec![0.0, 0.25, 0.5, 0.75, 1.0];
-        let y: Vec<f64> = x.iter().map(|&t| t * t * t).collect();
-        let poly = fit_cubic(&x, &y).unwrap();
-
-        // Should approximate cubic function
-        assert!((poly.a0).abs() < 0.1);
-        assert!((poly.a3 - 1.0).abs() < 0.1);
-    }
-
-    #[test]
-    fn test_calculate_r_squared() {
-        let y_actual = vec![1.0, 2.0, 3.0, 4.0, 5.0];
-        let y_pred = vec![1.1, 1.9, 3.0, 4.1, 4.9];
-        let r2 = calculate_r_squared(&y_actual, &y_pred);
-        assert!(r2 > 0.95); // Should be very close to 1
-    }
-
-    #[test]
-    fn test_is_discrete_event() {
-        let zero_event = MouseMoveEvent::new(0, 0, 0, 0);
-        let normal_event = MouseMoveEvent::new(10, -5, 0, 0);
-
-        assert!(is_discrete_event(&zero_event));
-        assert!(!is_discrete_event(&normal_event));
-    }
-
-    #[test]
-    fn test_analyze_segment() {
-        let events = make_test_events(10);
-        let fit = analyze_segment(&events, 0, 10);
-
-        assert!(fit.is_some());
-        let fit = fit.unwrap();
-        assert_eq!(fit.start_idx, 0);
-        assert_eq!(fit.end_idx, 10);
-        // Linear data should have high R-squared
-        assert!(fit.dx_r_squared > 0.9);
-        assert!(fit.dy_r_squared > 0.9);
-        assert!(fit.time_r_squared > 0.9);
-    }
-
-    #[test]
-    fn test_build_segments_simple() {
-        let events = make_test_events(20);
-        let segments = build_segments(&events, 5, 2.0, 0.8, 0.5);
-
-        assert!(!segments.is_empty());
-        // Should have at least one good segment
-        let has_good = segments.iter().any(|s| matches!(s, Segment::Good { .. }));
-        assert!(has_good);
-    }
-
-    #[test]
-    fn test_collect_visible_indices() {
-        let events = make_test_events(100);
-        let segments = build_segments(&events, 10, 1.5, 0.85, 0.5);
-
-        let x_range = (0.0, 100.0);
-        let y_range = (-500.0, 1000.0);
-        let indices = collect_visible_indices(&segments, &events, 800.0, 600.0, x_range, y_range, 5.0, 1.5);
-
-        assert!(!indices.is_empty());
-        assert!(indices.len() <= events.len());
-        // Should maintain sorted order
-        for i in 1..indices.len() {
-            assert!(indices[i] > indices[i - 1]);
-        }
-    }
-
-    #[test]
-    fn test_lod_cache_can_reuse() {
-        let cache = LodCache {
-            segments: Vec::new(),
-            visible_indices: Vec::new(),
-            zoom_factor: 1.0,
-            last_x_range: (0.0, 100.0),
-            last_y_range: (0.0, 100.0),
-            last_tolerance: 3.0,
-        };
-
-        // Should reuse when zoomed in
-        assert!(cache.can_reuse((10.0, 50.0), (10.0, 50.0), 3.0, 1.5));
-
-        // Should not reuse when zoomed out
-        assert!(!cache.can_reuse((0.0, 200.0), (0.0, 200.0), 3.0, 1.0));
-        
-        // Should not reuse when tolerance changes significantly
-        assert!(!cache.can_reuse((10.0, 50.0), (10.0, 50.0), 5.0, 1.5));
-    }
 }

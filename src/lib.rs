@@ -19,7 +19,7 @@
 //! let segments = build_segments(&events, 10, 1.6, 0.98, 0.091);
 //!
 //! // Collect visible indices for rendering
-//! let indices = collect_visible_indices(&segments, &events, 800.0, 600.0, 
+//! let indices = collect_visible_indices(&segments, &events, 800.0, 600.0,
 //!     (0.0, 100.0), (-500.0, 1000.0), 3.0, 1.5);
 //! ```
 
