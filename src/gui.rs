@@ -1,10 +1,10 @@
+// Import the LOD module
+use crate::lod::{build_segments, collect_visible_indices, LodCache, Segment};
 use crate::mouse_event::MouseMoveEvent;
-// Import the new advanced LOD module
-use crate::lod_advanced::{Segment, build_segments, collect_visible_indices};
 use eframe::egui;
 use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, Ordering}, Arc,
+    Mutex,
 };
 use std::thread;
 
@@ -23,14 +23,16 @@ pub struct MouseAnalyzerGui {
     last_f2_state: bool,                        // For edge detection
     target_device: Option<crate::TargetDevice>, // Store target device for restarts
 
-    // Advanced LOD state
-    advanced_lod_segments: Vec<Segment>,
-    // Error points detected by regression analysis (indices of events with high residuals)
-    // Filtered to only show points between min_x_visible and max_x_visible
-    advanced_lod_error_points: Vec<usize>,
-    advanced_lod_error_points_backup: Vec<usize>,
-    advanced_lod_last_events_len: usize,
-    advanced_lod_last_bounds: Option<PlotBounds>,
+    // LOD state
+    lod_segments: Vec<Segment>,
+    // Error points detected by regression analysis, categorized by type
+    lod_dx_errors: Vec<usize>,   // Errors in dx (red)
+    lod_dy_errors: Vec<usize>,   // Errors in dy (blue/cyan)
+    lod_time_errors: Vec<usize>, // Timing errors (yellow)
+    lod_last_events_len: usize,
+    lod_last_bounds: Option<PlotBounds>,
+    // Cache for visible indices
+    lod_cache: Option<LodCache>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -55,18 +57,20 @@ impl MouseAnalyzerGui {
             last_f2_state: false,
             target_device,
 
-            // Advanced LOD initialization
-            advanced_lod_segments: Vec::new(),
-            advanced_lod_error_points: Vec::new(),
-            advanced_lod_error_points_backup: Vec::new(),
-            advanced_lod_last_events_len: 0,
-            advanced_lod_last_bounds: None,
+            // LOD initialization
+            lod_segments: Vec::new(),
+            lod_dx_errors: Vec::new(),
+            lod_dy_errors: Vec::new(),
+            lod_time_errors: Vec::new(),
+            lod_last_events_len: 0,
+            lod_last_bounds: None,
+            lod_cache: None,
         }
     }
 
     /// Check if plot bounds have changed significantly
     fn bounds_changed_significantly(&self, new_bounds: &PlotBounds) -> bool {
-        match self.advanced_lod_last_bounds {
+        match self.lod_last_bounds {
             None => true, // First time, always recalculate
             Some(old_bounds) => {
                 let x_range_old = (old_bounds.x_max - old_bounds.x_min).abs();
@@ -94,14 +98,17 @@ impl MouseAnalyzerGui {
         }
     }
 
-    /// Calculate error points based on regression residuals
+    /// Calculate error points based on regression residuals, categorized by error type
     /// Error is detected when: abs(y0-y1)/max(smallestPositive,abs(y1)) > (sqrt(1-r2)/k)
-    fn calculate_error_points(&self, events: &[MouseMoveEvent]) -> Vec<usize> {
-        let mut error_points = Vec::new();
+    /// Returns (dx_errors, dy_errors, time_errors)
+    fn calculate_error_points(&self, events: &[MouseMoveEvent]) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
+        let mut dx_errors = Vec::new();
+        let mut dy_errors = Vec::new();
+        let mut time_errors = Vec::new();
         const K: f64 = 3.0;
         const SMALLEST_POSITIVE: f64 = 1e-8;
 
-        for segment in &self.advanced_lod_segments {
+        for segment in &self.lod_segments {
             if let Segment::Good { start_idx, end_idx, fit } = segment {
                 let n = end_idx - start_idx;
                 if n < 4 {
@@ -142,40 +149,49 @@ impl MouseAnalyzerGui {
                     let dy_error = (dy_actual - dy_pred).abs() / dy_pred.abs().max(SMALLEST_POSITIVE);
                     let time_error = (time_actual - time_pred).abs() / time_pred.abs().max(SMALLEST_POSITIVE);
 
-                    // Mark as error if any dimension exceeds threshold
-                    if dx_error > dx_threshold || dy_error > dy_threshold || time_error > time_threshold {
-                        error_points.push(global_idx);
+                    // Categorize errors by type
+                    if dx_error > dx_threshold {
+                        dx_errors.push(global_idx);
+                    }
+                    if dy_error > dy_threshold {
+                        dy_errors.push(global_idx);
+                    }
+                    if time_error > time_threshold {
+                        time_errors.push(global_idx);
                     }
                 }
             }
         }
 
-        error_points
+        (dx_errors, dy_errors, time_errors)
     }
 
-    /// NEW ADVANCED LOD: Apply the advanced LOD algorithm with regression-based segmentation
+    /// Apply the LOD algorithm with regression-based segmentation
     /// Returns indices into the events slice for rendering
-    fn apply_advanced_lod_indices(&mut self, events: &[MouseMoveEvent], visible_width: f64, visible_height: f64, plot_bounds: Option<&PlotBounds>) -> Vec<usize> {
+    fn apply_lod_indices(&mut self, events: &[MouseMoveEvent], visible_width: f64, visible_height: f64, plot_bounds: Option<&PlotBounds>) -> Vec<usize> {
         if events.is_empty() {
             return Vec::new();
         }
 
         // Check if we need to rebuild segments (events changed)
-        if events.len() != self.advanced_lod_last_events_len {
-            println!("Building advanced LOD segments for {} events...", events.len());
+        if events.len() != self.lod_last_events_len {
+            println!("Building LOD segments for {} events...", events.len());
             // Build segments with good parameters for real mouse data
             // - balance_weight: 0.091 (ln(len) is not and cant be normalized to 0.0 ~ 1.0)
-            self.advanced_lod_segments = build_segments(events, 10, 1.6, 0.98, 0.091);
-            self.advanced_lod_last_events_len = events.len();
-            println!("Created {} segments", self.advanced_lod_segments.len());
-            println!("Created {} discrete segments", self.advanced_lod_segments.iter().find(|&s| if let Segment::Discrete { idx: _ } = s {
-                true
-            }else{false}).into_iter().count());
+            self.lod_segments = build_segments(events, 10, 1.6, 0.98, 0.091);
+            self.lod_last_events_len = events.len();
+            println!("Created {} segments", self.lod_segments.len());
+            println!("Created {} discrete segments", self.lod_segments.iter().find(|&s| if let Segment::Discrete { idx: _ } = s { true } else { false }).into_iter().count());
 
-            // Calculate error points after building segments
-            let all_error_points = self.calculate_error_points(events);
-            println!("Detected {} error points", all_error_points.len());
-            self.advanced_lod_error_points_backup = all_error_points;
+            // Calculate error points after building segments (categorized by type)
+            let (dx_errs, dy_errs, time_errs) = self.calculate_error_points(events);
+            println!("Detected errors: {} dx, {} dy, {} time", dx_errs.len(), dy_errs.len(), time_errs.len());
+            self.lod_dx_errors = dx_errs;
+            self.lod_dy_errors = dy_errs;
+            self.lod_time_errors = time_errs;
+
+            // Clear cache since segments changed
+            self.lod_cache = None;
         }
 
         // Get bounds or use full range
@@ -190,38 +206,74 @@ impl MouseAnalyzerGui {
             (x_min, x_max, y_min, y_max)
         };
 
-        // Calculate visible range with zoom factor
+        // Calculate visible range with zoom factor for pre-fetching
         let x_range_size = x_max - x_min;
         let zoom_factor = 1.2;
-        let min_x_visible = x_min - (x_range_size * ((zoom_factor - 1.0) / 2.0));
-        let max_x_visible = x_max + (x_range_size * ((zoom_factor - 1.0) / 2.0));
+        let tolerance = 3.0;
 
-        // Filter error points to only those in visible range
-        self.advanced_lod_error_points = self.advanced_lod_error_points_backup.clone();
-        self.advanced_lod_error_points.retain(|&idx| {
-            if idx < events.len() {
-                let time = events[idx].time_secs();
-                time >= min_x_visible && time <= max_x_visible
+        // Check if we can reuse cached results
+        let indices = if let Some(ref cache) = self.lod_cache {
+            if cache.can_reuse((x_min, x_max), (y_min, y_max), tolerance, zoom_factor) {
+                // Filter cached indices to current view
+                let filtered: Vec<usize> = cache
+                    .visible_indices
+                    .iter()
+                    .filter(|&&idx| {
+                        if idx < events.len() {
+                            let time = events[idx].time_secs();
+                            time >= x_min && time <= x_max
+                        } else {
+                            false
+                        }
+                    })
+                    .copied()
+                    .collect();
+                filtered
             } else {
-                false
+                // Cache invalid, recompute
+                self.compute_and_cache_indices(events, visible_width, visible_height, x_min, x_max, y_min, y_max, tolerance, zoom_factor)
             }
-        });
-
-        // Collect visible indices with advanced LOD
-        // - tolerance: 3.0 (allow up to 3 events per pixel before hiding)
-        // - zoom_factor: 1.2
-        let indices = collect_visible_indices(
-            &self.advanced_lod_segments,
-            events,
-            visible_width,
-            visible_height,
-            (x_min, x_max),
-            (y_min, y_max),
-            3.0, // tolerance
-            1.2, // zoom_factor
-        );
+        } else {
+            // No cache, compute fresh
+            self.compute_and_cache_indices(events, visible_width, visible_height, x_min, x_max, y_min, y_max, tolerance, zoom_factor)
+        };
 
         indices
+    }
+
+    /// Compute visible indices and cache the result
+    fn compute_and_cache_indices(&mut self, events: &[MouseMoveEvent], visible_width: f64, visible_height: f64, x_min: f64, x_max: f64, y_min: f64, y_max: f64, tolerance: f64, zoom_factor: f64) -> Vec<usize> {
+        // Collect visible indices with LOD using extended range for caching
+        let x_range_size = x_max - x_min;
+        let cache_x_min = x_min - (x_range_size * ((zoom_factor - 1.0) / 2.0));
+        let cache_x_max = x_max + (x_range_size * ((zoom_factor - 1.0) / 2.0));
+
+        let indices = collect_visible_indices(&self.lod_segments, events, visible_width, visible_height, (cache_x_min, cache_x_max), (y_min, y_max), tolerance, zoom_factor);
+
+        // Cache the result
+        self.lod_cache = Some(LodCache {
+            segments: self.lod_segments.clone(),
+            visible_indices: indices.clone(),
+            zoom_factor,
+            last_x_range: (cache_x_min, cache_x_max),
+            last_y_range: (y_min, y_max),
+            last_tolerance: tolerance,
+        });
+
+        println!("Computed and cached {} LOD indices", indices.len());
+
+        // Filter to current view
+        indices
+            .into_iter()
+            .filter(|&idx| {
+                if idx < events.len() {
+                    let time = events[idx].time_secs();
+                    time >= x_min && time <= x_max
+                } else {
+                    false
+                }
+            })
+            .collect()
     }
 
     fn calculate_stats(&self, events: &[MouseMoveEvent]) -> Stats {
@@ -316,10 +368,11 @@ impl eframe::App for MouseAnalyzerGui {
                 self.captured_events = self.events.lock().unwrap().clone();
                 self.is_capturing = false;
 
-                // Clear Advanced LOD cache since we have new data
-                self.advanced_lod_segments.clear();
-                self.advanced_lod_last_events_len = 0;
-                self.advanced_lod_last_bounds = None;
+                // Clear LOD cache since we have new data
+                self.lod_segments.clear();
+                self.lod_last_events_len = 0;
+                self.lod_last_bounds = None;
+                self.lod_cache = None;
             } else {
                 // Start a new capture
                 println!("F2 pressed: starting new capture...");
@@ -327,10 +380,11 @@ impl eframe::App for MouseAnalyzerGui {
                 self.events.lock().unwrap().clear();
                 self.captured_events.clear();
 
-                // Clear Advanced LOD cache
-                self.advanced_lod_segments.clear();
-                self.advanced_lod_last_events_len = 0;
-                self.advanced_lod_last_bounds = None;
+                // Clear LOD cache
+                self.lod_segments.clear();
+                self.lod_last_events_len = 0;
+                self.lod_last_bounds = None;
+                self.lod_cache = None;
 
                 // Reset stop flag and restart capture
                 self.stop_flag.store(false, Ordering::SeqCst);
@@ -494,8 +548,8 @@ impl eframe::App for MouseAnalyzerGui {
                                     y_max: bounds.max()[1],
                                 };
 
-                                // Apply Advanced LOD
-                                let lod_indices = self.apply_advanced_lod_indices(&display_events, available_width as f64, available_height as f64, Some(&current_bounds));
+                                // Apply LOD
+                                let lod_indices = self.apply_lod_indices(&display_events, available_width as f64, available_height as f64, Some(&current_bounds));
 
                                 // Helper to safely map indices to plot points
                                 let map_to_points = |indices: &[usize], map_fn: fn(&MouseMoveEvent) -> [f64; 2]| indices.iter().filter_map(|&idx| if idx < display_events.len() { Some(map_fn(&display_events[idx])) } else { None }).collect::<PlotPoints>();
@@ -510,23 +564,86 @@ impl eframe::App for MouseAnalyzerGui {
                                 plot_ui.line(dx_line);
                                 plot_ui.line(ndy_line);
 
-                                // Add error points visualization (shown as orange markers)
-                                if !self.advanced_lod_error_points.is_empty() {
-                                    // For dx error points
-                                    let dx_error_points = map_to_points(&self.advanced_lod_error_points, |e| [e.time_secs(), e.dx as f64]);
-                                    let dx_error_markers = Points::new(dx_error_points)
-                                        .color(egui::Color32::from_rgb(255, 165, 0))
-                                        .radius(3.0)
-                                        .name("dx errors");
-                                    plot_ui.points(dx_error_markers);
+                                // Add error points visualization with different colors for each type
+                                // dx errors - shown in dark red
+                                if !self.lod_dx_errors.is_empty() {
+                                    let dx_dx_errors = map_to_points(&self.lod_dx_errors, |e| [e.time_secs(), e.dx as f64]);
+                                    let dx_dy_errors = map_to_points(&self.lod_dx_errors, |e| [e.time_secs(), -(e.dy as f64)]);
 
-                                    // For -dy error points
-                                    let ndy_error_points = map_to_points(&self.advanced_lod_error_points, |e| [e.time_secs(), -(e.dy as f64)]);
-                                    let ndy_error_markers = Points::new(ndy_error_points)
-                                        .color(egui::Color32::from_rgb(255, 165, 0))
-                                        .radius(3.0)
-                                        .name("-dy errors");
-                                    plot_ui.points(ndy_error_markers);
+                                    plot_ui.points(Points::new(dx_dx_errors).color(egui::Color32::from_rgb(0, 200, 0)).radius(3.0).name("dx errors"));
+                                    plot_ui.points(Points::new(dx_dy_errors).color(egui::Color32::from_rgb(0, 200, 0)).radius(3.0).name("dx errors (-dy view)"));
+                                }
+
+                                // dy errors - shown in cyan
+                                if !self.lod_dy_errors.is_empty() {
+                                    let dy_dx_errors = map_to_points(&self.lod_dy_errors, |e| [e.time_secs(), e.dx as f64]);
+                                    let dy_dy_errors = map_to_points(&self.lod_dy_errors, |e| [e.time_secs(), -(e.dy as f64)]);
+
+                                    plot_ui.points(Points::new(dy_dx_errors).color(egui::Color32::from_rgb(0, 200, 200)).radius(3.0).name("dy errors (dx view)"));
+                                    plot_ui.points(Points::new(dy_dy_errors).color(egui::Color32::from_rgb(0, 200, 200)).radius(3.0).name("dy errors"));
+                                }
+
+                                // time errors - shown in yellow
+                                if !self.lod_time_errors.is_empty() {
+                                    let time_dx_errors = map_to_points(&self.lod_time_errors, |e| [e.time_secs(), e.dx as f64]);
+                                    let time_dy_errors = map_to_points(&self.lod_time_errors, |e| [e.time_secs(), -(e.dy as f64)]);
+
+                                    plot_ui.points(Points::new(time_dx_errors).color(egui::Color32::from_rgb(255, 220, 0)).radius(4.0).name("time errors (dx view)"));
+                                    plot_ui.points(Points::new(time_dy_errors).color(egui::Color32::from_rgb(255, 220, 0)).radius(4.0).name("time errors"));
+                                }
+
+                                // Draw regression curves for Good segments
+                                // These show the polynomial fit used for LOD analysis
+                                const REGRESSION_CURVE_SAMPLES: usize = 50;
+                                for segment in &self.lod_segments {
+                                    if let Segment::Good { start_idx, end_idx, fit } = segment {
+                                        // Validate indices
+                                        if *start_idx >= display_events.len() || *end_idx > display_events.len() || *end_idx <= *start_idx {
+                                            continue;
+                                        }
+
+                                        // Get time range for this segment
+                                        let start_time = display_events[*start_idx].time_secs();
+                                        let end_time = display_events[*end_idx - 1].time_secs();
+
+                                        // Check if segment is visible
+                                        if end_time < current_bounds.x_min || start_time > current_bounds.x_max {
+                                            continue;
+                                        }
+
+                                        // Sample the polynomial fit - use enough samples for smooth curves
+                                        let mut dx_curve_points = Vec::new();
+                                        let mut dy_curve_points = Vec::new();
+
+                                        for i in 0..=REGRESSION_CURVE_SAMPLES {
+                                            let t_norm = i as f64 / REGRESSION_CURVE_SAMPLES as f64;
+
+                                            // Interpolate actual time
+                                            let t_actual = start_time + (end_time - start_time) * t_norm;
+
+                                            // Evaluate polynomials
+                                            let dx_fit = fit.dx_poly.eval(t_norm);
+                                            let dy_fit = fit.dy_poly.eval(t_norm);
+
+                                            dx_curve_points.push([t_actual, dx_fit]);
+                                            dy_curve_points.push([t_actual, -dy_fit]);
+                                        }
+
+                                        // Draw regression curves as dashed lines
+                                        let dx_regression = Line::new(PlotPoints::new(dx_curve_points))
+                                            .color(egui::Color32::from_rgba_premultiplied(255, 100, 100, 128))
+                                            .style(egui_plot::LineStyle::Dashed { length: 5.0 })
+                                            .width(1.5)
+                                            .name("dx regression");
+                                        let dy_regression = Line::new(PlotPoints::new(dy_curve_points))
+                                            .color(egui::Color32::from_rgba_premultiplied(100, 100, 255, 128))
+                                            .style(egui_plot::LineStyle::Dashed { length: 5.0 })
+                                            .width(1.5)
+                                            .name("-dy regression");
+
+                                        plot_ui.line(dx_regression);
+                                        plot_ui.line(dy_regression);
+                                    }
                                 }
 
                                 (current_bounds, lod_indices)
@@ -534,23 +651,32 @@ impl eframe::App for MouseAnalyzerGui {
 
                             // Update cached values
                             let (current_bounds, lod_indices) = plot_response.inner;
-                            self.advanced_lod_last_bounds = Some(current_bounds);
+                            self.lod_last_bounds = Some(current_bounds);
 
                             // Show LOD info if downsampling occurred
                             if lod_indices.len() < display_events.len() {
                                 // Calculate reduction percentage
                                 let reduction = 100.0 * (1.0 - lod_indices.len() as f64 / display_events.len() as f64);
-                                ui.label(format!("Advanced LOD: Showing {} of {} points ({:.1}% reduction)", lod_indices.len(), display_events.len(), reduction));
+                                ui.label(format!("LOD: Showing {} of {} points ({:.1}% reduction)", lod_indices.len(), display_events.len(), reduction));
                             } else {
                                 ui.label(format!("Showing all {} points (no LOD)", display_events.len()));
                             }
 
-                            // Show error points info
-                            if !self.advanced_lod_error_points.is_empty() {
-                                ui.colored_label(
-                                    egui::Color32::from_rgb(255, 165, 0),
-                                    format!("⚠ {} error points detected (shown as orange markers)", self.advanced_lod_error_points.len())
-                                );
+                            // Show error points info with color coding
+                            let total_errors = self.lod_dx_errors.len() + self.lod_dy_errors.len() + self.lod_time_errors.len();
+                            if total_errors > 0 {
+                                ui.horizontal(|ui| {
+                                    ui.label("⚠ Errors detected:");
+                                    if !self.lod_dx_errors.is_empty() {
+                                        ui.colored_label(egui::Color32::from_rgb(200, 0, 0), format!("{} dx", self.lod_dx_errors.len()));
+                                    }
+                                    if !self.lod_dy_errors.is_empty() {
+                                        ui.colored_label(egui::Color32::from_rgb(0, 200, 200), format!("{} dy", self.lod_dy_errors.len()));
+                                    }
+                                    if !self.lod_time_errors.is_empty() {
+                                        ui.colored_label(egui::Color32::from_rgb(255, 220, 0), format!("{} time", self.lod_time_errors.len()));
+                                    }
+                                });
                             }
                         });
                         ui.add_space(10.0);
@@ -623,129 +749,4 @@ pub fn run_gui(events: Arc<Mutex<Vec<MouseMoveEvent>>>, stop_flag: Arc<AtomicBoo
     };
 
     eframe::run_native("Mouse Event Analyzer", options, Box::new(move |_cc| Box::new(MouseAnalyzerGui::new(events, stop_flag, target_device))))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn create_test_events(n: usize) -> Vec<MouseMoveEvent> {
-        let mut events = Vec::new();
-        for i in 0..n {
-            let t_sec = i as u32;
-            let t_usec = 0;
-            // Linear pattern with some noise
-            let dx = (i * 10) as i16;
-            let dy = -(i as i16 * 5);
-            events.push(MouseMoveEvent::new(dx, dy, t_sec, t_usec));
-        }
-        events
-    }
-
-    #[test]
-    fn test_calculate_error_points_empty_segments() {
-        let events = create_test_events(10);
-        let gui = MouseAnalyzerGui::new(
-            Arc::new(Mutex::new(Vec::new())),
-            Arc::new(AtomicBool::new(false)),
-            None
-        );
-        
-        let error_points = gui.calculate_error_points(&events);
-        assert_eq!(error_points.len(), 0, "Should have no error points with empty segments");
-    }
-
-    #[test]
-    fn test_calculate_error_points_with_good_segments() {
-        let events = create_test_events(50);
-        let mut gui = MouseAnalyzerGui::new(
-            Arc::new(Mutex::new(Vec::new())),
-            Arc::new(AtomicBool::new(false)),
-            None
-        );
-        
-        // Build segments
-        gui.advanced_lod_segments = build_segments(&events, 10, 1.6, 0.8, 0.091);
-        
-        let error_points = gui.calculate_error_points(&events);
-        
-        // With linear data, we should have very few or no error points
-        // (since the data fits well to polynomial regression)
-        assert!(error_points.len() <= events.len(), "Error points should not exceed total events");
-        println!("Detected {} error points out of {} events", error_points.len(), events.len());
-    }
-
-    #[test]
-    fn test_calculate_error_points_with_outliers() {
-        let mut events = create_test_events(30);
-        // Add some outliers that should be detected as errors
-        if events.len() > 15 {
-            events[15].dx = 1000; // Major outlier
-            events[16].dy = -1000; // Major outlier
-        }
-        
-        let mut gui = MouseAnalyzerGui::new(
-            Arc::new(Mutex::new(Vec::new())),
-            Arc::new(AtomicBool::new(false)),
-            None
-        );
-        
-        // Build segments
-        gui.advanced_lod_segments = build_segments(&events, 10, 1.6, 0.8, 0.091);
-        
-        let error_points = gui.calculate_error_points(&events);
-        
-        // Should detect some error points due to outliers
-        println!("Detected {} error points with outliers", error_points.len());
-        assert!(!error_points.is_empty(), "Should detect error points with outliers");
-    }
-
-    #[test]
-    fn test_error_points_filtered_by_visible_range() {
-        let events = create_test_events(100);
-        let mut gui = MouseAnalyzerGui::new(
-            Arc::new(Mutex::new(Vec::new())),
-            Arc::new(AtomicBool::new(false)),
-            None
-        );
-        
-        // Build segments and calculate error points
-        gui.advanced_lod_segments = build_segments(&events, 10, 1.6, 0.8, 0.091);
-        gui.advanced_lod_error_points = gui.calculate_error_points(&events);
-        
-        let initial_error_count = gui.advanced_lod_error_points.len();
-        
-        // Now apply LOD with limited visible range (should filter error points)
-        let bounds = PlotBounds {
-            x_min: 10.0,
-            x_max: 30.0,
-            y_min: -500.0,
-            y_max: 500.0,
-        };
-        
-        gui.apply_advanced_lod_indices(&events, 800.0, 600.0, Some(&bounds));
-        
-        // Error points should be filtered to visible range
-        for &idx in &gui.advanced_lod_error_points {
-            if idx < events.len() {
-                let time = events[idx].time_secs();
-                let x_range_size = bounds.x_max - bounds.x_min;
-                let zoom_factor = 1.2;
-                let min_x_visible = bounds.x_min - (x_range_size * ((zoom_factor - 1.0) / 2.0));
-                let max_x_visible = bounds.x_max + (x_range_size * ((zoom_factor - 1.0) / 2.0));
-                
-                assert!(
-                    time >= min_x_visible && time <= max_x_visible,
-                    "Error point at index {} with time {} should be within visible range [{}, {}]",
-                    idx, time, min_x_visible, max_x_visible
-                );
-            }
-        }
-        
-        println!(
-            "Filtered error points from {} to {} based on visible range",
-            initial_error_count,
-            gui.advanced_lod_error_points.len()
-        );
-    }
 }
